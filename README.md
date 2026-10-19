@@ -1,53 +1,25 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | ESP32-S31 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | --------- | ----- |
+ESP32-S3 UART SEQUENCE TEST compatible with Raspberry Pi pi_uart_seq.py
 
-# Hello World Example
+This package contains only the main/ folder files for an EXISTING ESP-IDF project.
+1) In your existing ESP32S3_TEST project, remove or rename the original hello_world_main.c.
+2) Copy main/main.c and main/CMakeLists.txt into that project's main/ folder.
+3) In the ESP-IDF Terminal opened in the project ROOT, run:
+      idf.py set-target esp32s3    (only if project target is not yet esp32s3)
+      idf.py build
+      idf.py -p COM3 flash monitor
+4) Leave the board plugged into the computer's COM-labelled USB-C port.
+5) Cross-wire Raspberry Pi 4's GPIO UART (3.3V logic only):
+      Pi physical PIN 8  GPIO14 TXD --> ESP GPIO18 RX (UART1)
+      Pi physical PIN 10 GPIO15 RXD <-- ESP GPIO17 TX (UART1)
+      Pi physical PIN 6  GND       --- ESP GND
+   Do not connect the Pi 5V/3V3 power pins; keep grounds common.
+6) From Raspberry Pi 4, stop ROS serial users and run:
+      python3 pi_uart_seq.py --port /dev/serial0 --baud 57600 --count 100
+   Expected only when correctly wired and working:
+      RESULT 100/100 matched, 0 failed, 0 unexpected lines
 
-Starts a FreeRTOS task to print "Hello World".
-
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
-
-## How to use example
-
-Follow detailed instructions provided specifically for this example.
-
-Select the instructions depending on Espressif chip installed on your development board:
-
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
-
-
-## Example folder contents
-
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
-
-```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
-```
-
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
-
-## Troubleshooting
-
-* Program upload failure
-
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
-
-## Technical support and feedback
-
-Please use the following feedback channels:
-
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
-
-We will get back to you as soon as possible.
+IMPORTANT: This firmware listens on ESP UART1 GPIO17/18, NOT the COM/USB connector.
+The COM USB port and COM3 remain for flashing/logging on your Windows PC.
+If your Pi is connected to ESP via a USB cable instead of GPIO wires,
+this firmware must be adapted to that serial interface.
+No motors are activated by this firmware.
