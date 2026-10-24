@@ -6,7 +6,7 @@
 // Confirm IBT-2 74HC244 + driver supply levels and raise wheels BEFORE testing.
 
 #define ENABLE_CLOSED_LOOP_TEST 1 // Change to 1 ONLY after hardware safety checks.
-#define ALLOW_DUAL_WHEEL_TEST 0  // Keep at 0 in the initial bench tests.
+#define ALLOW_DUAL_WHEEL_TEST 1  // Keep at 0 in the initial bench tests.
 
 #include <stdbool.h>
 #include <stddef.h>
