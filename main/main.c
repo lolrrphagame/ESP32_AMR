@@ -51,6 +51,9 @@
 #define PI_KI              0.80f
 #define FEEDFORWARD_BIAS   12.0f
 #define FEEDFORWARD_SLOPE  0.24f
+// Phase 4E.2: add 1 percentage point of FF only to LEFT wheel going forward.
+// Set to 0.0f to revert tuning while retaining the modified source file.
+#define LEFT_FORWARD_FF_TRIM 1.0f
 
 static const char *TAG = "AMR_P4";
 static pcnt_unit_handle_t enc[2];
@@ -281,7 +284,11 @@ static void control_task(void *arg)
                 const float error = fabsf(ref) - measured_along_command;
                 // Anti-windup: cap integral in duty-percent units.
                 integral[i] = limitf(integral[i] + PI_KI * error * dt, -15.0f, 15.0f);
-                const float ff = FEEDFORWARD_BIAS + FEEDFORWARD_SLOPE * fabsf(ref);
+                // Wheel-specific forward trim; leave right wheel and reverse unchanged.
+                const float wheel_trim =
+                    (i == 0 && ref > 0.0f) ? LEFT_FORWARD_FF_TRIM : 0.0f;
+                const float ff = FEEDFORWARD_BIAS + FEEDFORWARD_SLOPE * fabsf(ref)
+                               + wheel_trim;
                 const float desired_duty = limitf(ff + PI_KP * error + integral[i], 0.0f, MAX_DUTY_PERCENT);
                 const float duty = limitf(desired_duty, fmaxf(0.0f, duty_last[i] - DUTY_RAMP_PER_TICK),
                                            duty_last[i] + DUTY_RAMP_PER_TICK);
