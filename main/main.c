@@ -51,9 +51,9 @@
 #define PI_KI              0.80f
 #define FEEDFORWARD_BIAS   12.0f
 #define FEEDFORWARD_SLOPE  0.24f
-// Phase 4E.2: add 1 percentage point of FF only to LEFT wheel going forward.
+// Phase 4E.3: tune forward-only FF trim for LEFT wheel (duty-percent points).
 // Set to 0.0f to revert tuning while retaining the modified source file.
-#define LEFT_FORWARD_FF_TRIM 1.0f
+#define LEFT_FORWARD_FF_TRIM 1.5f
 
 static const char *TAG = "AMR_P4";
 static pcnt_unit_handle_t enc[2];
