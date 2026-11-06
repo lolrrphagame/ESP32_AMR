@@ -51,9 +51,19 @@
 #define PI_KI              0.80f
 #define FEEDFORWARD_BIAS   12.0f
 #define FEEDFORWARD_SLOPE  0.24f
-// Phase 4E.3: tune forward-only FF trim for LEFT wheel (duty-percent points).
-// Set to 0.0f to revert tuning while retaining the modified source file.
+// Phase 4E.3: keep the experimentally tested left-wheel forward trim.
 #define LEFT_FORWARD_FF_TRIM 1.5f
+
+// Phase 4F: small outer encoder-position synchronizer for STRAIGHT FORWARD only.
+// Preserve original UART protocol and independent PI speed controllers.
+// Set to 0 for an A/B comparison using the same firmware; rebuild and flash.
+#define ENABLE_STRAIGHT_SYNC     1
+#define SYNC_MIN_BASE_RPM       7.0f
+#define SYNC_MAX_BASE_RPM      20.0f
+#define SYNC_KP_RPM_PER_TICK    0.006f // 100 ticks error -> 0.6 RPM per wheel.
+#define SYNC_MAX_CORR_RPM       1.0f   // Bounds adjustment to commanded target.
+#define SYNC_SLEW_RPM_PER_TICK  0.06f  // Max step per 20 ms controller tick.
+#define SYNC_MAX_ERROR_TICKS    800    // Stop if straight-wheel mismatch is excessive.
 
 static const char *TAG = "AMR_P4";
 static pcnt_unit_handle_t enc[2];
@@ -83,6 +93,10 @@ typedef struct {
     int32_t ticks[2];             // Normalized signed ticks (R has inverted raw sign).
     uint32_t uart_errors;
     uint32_t control_faults;
+    uint32_t motion_epoch;        // Invalidate synchronizer after ANY STOP/re-arm.
+    bool sync_enabled;            // Diagnostic fields; not part of UART protocol.
+    int32_t sync_error_ticks;     // (right delta - left delta) since straight segment start.
+    float sync_correction_rpm;    // Added to L, subtracted from R when straight forward.
 } app_state_t;
 static app_state_t st;
 
@@ -150,6 +164,10 @@ static void motor_disable_one_locked(int wheel)
 
 static void stop_all_locked(void)
 {
+    st.motion_epoch++; // Handles STOP followed by ARM/V between control cycles.
+    st.sync_enabled = false;
+    st.sync_error_ticks = 0;
+    st.sync_correction_rpm = 0.0f;
     for (int i = 0; i < 2; ++i) motor_disable_one_locked(i);
     st.armed = false;
     st.active = false;
@@ -237,6 +255,11 @@ static void control_task(void *arg)
     float integral[2] = {0, 0};
     float duty_last[2] = {0, 0};
     int stall_ms[2] = {0, 0};
+    bool sync_tracking = false;
+    uint32_t sync_epoch = 0;
+    int32_t sync_start[2] = {0, 0};
+    float sync_base_rpm = 0.0f;
+    float sync_corr_rpm = 0.0f;
     int64_t previous_us = esp_timer_get_time();
     int64_t log_us = previous_us;
     TickType_t next = xTaskGetTickCount();
@@ -272,9 +295,59 @@ static void control_task(void *arg)
             if (st.active) { st.control_faults++; fault = true; }
             stop_all_locked();
         }
+        // Outer loop is deliberately OFF for reverse, turning, unequal wheel setpoints,
+        // very slow/fast test motions, or whenever the motors are not active.
+        // Q and the log retain ORIGINAL commanded RPM in st.target[].
+        float effective_ref[2] = {st.target[0], st.target[1]};
+#if ENABLE_STRAIGHT_SYNC
+        const bool straight_forward = st.active &&
+            st.target[0] >= SYNC_MIN_BASE_RPM &&
+            st.target[0] <= SYNC_MAX_BASE_RPM &&
+            fabsf(st.target[0] - st.target[1]) < 0.05f;
+        if (straight_forward) {
+            // Reset reference counts at every new straight segment or motion session.
+            if (!sync_tracking || sync_epoch != st.motion_epoch ||
+                fabsf(sync_base_rpm - st.target[0]) > 0.05f) {
+                sync_start[0] = count[0];
+                sync_start[1] = count[1];
+                sync_corr_rpm = 0.0f;
+                sync_base_rpm = st.target[0];
+                sync_epoch = st.motion_epoch;
+                sync_tracking = true;
+            }
+            const int32_t left_delta = count[0] - sync_start[0];
+            const int32_t right_delta = count[1] - sync_start[1];
+            // When right is ahead, speed up left slightly and slow down right.
+            const int32_t error_ticks = right_delta - left_delta;
+            if (error_ticks > SYNC_MAX_ERROR_TICKS || error_ticks < -SYNC_MAX_ERROR_TICKS) {
+                st.control_faults++;
+                fault = true;
+                stop_all_locked();  // Fail safe on unexpected encoder disagreement.
+                sync_tracking = false;
+                sync_corr_rpm = 0.0f;
+            } else {
+                const float wanted = limitf(error_ticks * SYNC_KP_RPM_PER_TICK,
+                    -SYNC_MAX_CORR_RPM, SYNC_MAX_CORR_RPM);
+                sync_corr_rpm = limitf(wanted,
+                    sync_corr_rpm - SYNC_SLEW_RPM_PER_TICK,
+                    sync_corr_rpm + SYNC_SLEW_RPM_PER_TICK);
+                effective_ref[0] = st.target[0] + sync_corr_rpm;
+                effective_ref[1] = st.target[1] - sync_corr_rpm;
+                st.sync_enabled = true;
+                st.sync_error_ticks = error_ticks;
+                st.sync_correction_rpm = sync_corr_rpm;
+            }
+        } else {
+            sync_tracking = false;
+            sync_corr_rpm = 0.0f;
+            st.sync_enabled = false;
+            st.sync_error_ticks = 0;
+            st.sync_correction_rpm = 0.0f;
+        }
+#endif
         if (st.active) {
             for (int i = 0; i < 2; ++i) {
-                const float ref = st.target[i];
+                const float ref = effective_ref[i];
                 if (fabsf(ref) < 0.1f) {
                     integral[i] = 0; duty_last[i] = 0; stall_ms[i] = 0;
                     motor_disable_one_locked(i);
@@ -305,6 +378,11 @@ static void control_task(void *arg)
             }
         }
         if (!st.active) {
+            sync_tracking = false;
+            sync_corr_rpm = 0.0f;
+            st.sync_enabled = false;
+            st.sync_error_ticks = 0;
+            st.sync_correction_rpm = 0.0f;
             for (int i = 0; i < 2; ++i) {
                 integral[i] = duty_last[i] = 0;
                 stall_ms[i] = 0;
@@ -319,10 +397,11 @@ static void control_task(void *arg)
         unlock_state();
         if (fault) ESP_LOGW(TAG, "CONTROL STOP: deadline, heartbeat, PCNT, stall or timing fault");
         if (report) ESP_LOGI(TAG,
-            "armed=%d active=%d | L ref=%+.1f act=%+.1f duty=%.1f ticks=%ld | R ref=%+.1f act=%+.1f duty=%.1f ticks=%ld",
+            "armed=%d active=%d | L ref=%+.1f act=%+.1f duty=%.1f ticks=%ld | R ref=%+.1f act=%+.1f duty=%.1f ticks=%ld | SYNC=%d e=%ld corr=%+.2f",
             snapshot.armed, snapshot.active,
             snapshot.target[0], snapshot.measured[0], snapshot.duty[0], (long)snapshot.ticks[0],
-            snapshot.target[1], snapshot.measured[1], snapshot.duty[1], (long)snapshot.ticks[1]);
+            snapshot.target[1], snapshot.measured[1], snapshot.duty[1], (long)snapshot.ticks[1],
+            snapshot.sync_enabled, (long)snapshot.sync_error_ticks, snapshot.sync_correction_rpm);
     }
 }
 
@@ -516,10 +595,12 @@ void app_main(void)
     motor_hw_init();
     uart_init();
     if (xTaskCreate(control_task, "amr_pi_control", 6144, NULL, 7, NULL) != pdPASS) abort();
-    ESP_LOGI(TAG, "Phase 4: dual PI code (bench SINGLE wheel enabled option)");
+    ESP_LOGI(TAG, "Phase 4F: dual-wheel PI plus bounded forward-straight encoder sync (optional)");
+    ESP_LOGI(TAG, "Straight sync enabled=%d, kp=%.4f RPM/tick, cap=%.1f RPM",
+        ENABLE_STRAIGHT_SYNC, (double)SYNC_KP_RPM_PER_TICK, (double)SYNC_MAX_CORR_RPM);
     ESP_LOGI(TAG, "PCNT x4 CPR=3960; L forward=LPWM; R forward=RPWM; UART1=57600");
 #if ENABLE_CLOSED_LOOP_TEST
-    ESP_LOGW(TAG, "BENCH PI TEST ENABLED: ARM then V repeated; wheel raised + fuse + E-stop REQUIRED");
+    ESP_LOGW(TAG, "BENCH first: ARM then repeated V; raise wheels, verify fuse + physical E-stop");
 #else
     ESP_LOGW(TAG, "BENCH PI TEST DISABLED, motors remain OFF. Change ENABLE_CLOSED_LOOP_TEST to 1 after checks");
 #endif
