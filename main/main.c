@@ -1,16 +1,18 @@
-// ESP32-S3 AMR - Phase 4: BENCH-ONLY single-wheel closed-loop PI velocity control.
+// ESP32-S3 AMR - Phase 4L.1: guarded bench-only PI velocity control.
 // ESP-IDF 6.1. GPIO assignments retained from tested Phase 3.
-// STARTUP: motors are OFF. No autonomous movement. A valid ARM + repeated V
-// commands are necessary. STOP, bad serial framing, heartbeat or arm expiry disable motors.
+// STARTUP: motors are OFF. ARM or ARM_CONT and valid V frames are necessary.
+// STOP, framing faults, heartbeat loss and applicable arm expiry disable motors.
 // WARNING: Software stops are NOT a substitute for a physical E-stop, fuse, and EN pull-downs.
 // Confirm IBT-2 74HC244 + driver supply levels and raise wheels BEFORE testing.
 
 #define ENABLE_CLOSED_LOOP_TEST 1 // Change to 1 ONLY after hardware safety checks.
 #define ALLOW_DUAL_WHEEL_TEST 1  // Keep at 0 in the initial bench tests.
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +24,7 @@
 #include "driver/uart.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,6 +42,10 @@
 #define CTRL_PERIOD_MS     20
 #define HEARTBEAT_US       300000LL
 #define ARM_WINDOW_US      5000000LL
+#define STATIONARY_US      250000LL
+#define STATIONARY_RPM     1.0f
+#define STALL_TIMEOUT_US   800000LL
+#define MIN_SETPOINT_RPM   5.0f
 #define MAX_SETPOINT_RPM   40.0f
 #define MAX_MEASURED_RPM   160.0f
 #define PWM_RESOLUTION_HZ  10000000
@@ -70,6 +77,7 @@ static pcnt_unit_handle_t enc[2];
 static mcpwm_timer_handle_t pwm_timer;
 static QueueHandle_t uart_events;
 static SemaphoreHandle_t state_mutex;
+static uint32_t boot_id;
 
 typedef struct {
     mcpwm_oper_handle_t oper;
@@ -85,6 +93,11 @@ static motor_hw_t motors[2];
 typedef struct {
     bool armed;
     bool active;
+    bool continuous;
+    bool stationary;
+    int64_t quiet_since_us;
+    const char *fault_reason;     // First fault, cleared only by an ESP32 reboot.
+    int last_direction[2];       // Survives zero-wheel targets and STOP.
     int64_t arm_deadline_us;
     int64_t last_command_us;
     float target[2];              // Normalized: POSITIVE == robot forward on BOTH wheels.
@@ -169,11 +182,36 @@ static void stop_all_locked(void)
     st.sync_error_ticks = 0;
     st.sync_correction_rpm = 0.0f;
     for (int i = 0; i < 2; ++i) motor_disable_one_locked(i);
+    if (st.active) {
+        st.stationary = false;
+        st.quiet_since_us = 0;
+    }
+    st.continuous = false;
     st.armed = false;
     st.active = false;
     st.arm_deadline_us = 0;
     st.last_command_us = 0;
     st.target[0] = st.target[1] = 0.0f;
+}
+
+static void latch_fault_locked(const char *reason, bool uart_fault)
+{
+    if (uart_fault) st.uart_errors++;
+    else st.control_faults++;
+    if (!st.fault_reason) st.fault_reason = reason;
+    stop_all_locked();
+}
+
+// Both the control loop and UART admission enforce deadlines, so a late V
+// cannot renew an expired heartbeat between control ticks.
+static void check_deadlines_locked(int64_t now)
+{
+    if (st.active && now - st.last_command_us >= HEARTBEAT_US) {
+        latch_fault_locked("HEARTBEAT", false);
+    } else if (st.armed && (!st.continuous || !st.active) && now >= st.arm_deadline_us) {
+        if (st.active) latch_fault_locked("ARM_EXPIRED", false);
+        else stop_all_locked();
+    }
 }
 
 static void motor_hw_init(void)
@@ -234,7 +272,6 @@ static void motor_apply_locked(int wheel, float target_rpm, float duty, int64_t 
         m->primed = true;
         m->channel = channel;
         m->ready_at_us = now_us + 10000LL; // Allow >=10ms for timer comparator update.
-        st.duty[wheel] = duty;
         return;
     }
     ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(m->cmp[channel], ticks));
@@ -242,8 +279,8 @@ static void motor_apply_locked(int wheel, float target_rpm, float duty, int64_t 
     if (now_us >= m->ready_at_us) {
         ESP_ERROR_CHECK(gpio_set_level(m->en_r, 1));
         ESP_ERROR_CHECK(gpio_set_level(m->en_l, 1));
+        st.duty[wheel] = ticks * 100.0f / PWM_PERIOD_TICKS;
     }
-    st.duty[wheel] = duty;
 }
 
 static void control_task(void *arg)
@@ -255,8 +292,10 @@ static void control_task(void *arg)
     float integral[2] = {0, 0};
     float duty_last[2] = {0, 0};
     int stall_ms[2] = {0, 0};
+    int64_t no_progress_since[2] = {0, 0};
     bool sync_tracking = false;
     uint32_t sync_epoch = 0;
+    uint32_t pi_epoch = 0;
     int32_t sync_start[2] = {0, 0};
     float sync_base_rpm = 0.0f;
     float sync_corr_rpm = 0.0f;
@@ -269,31 +308,47 @@ static void control_task(void *arg)
         esp_err_t a = pcnt_unit_get_count(enc[0], &raw[0]);
         esp_err_t b = pcnt_unit_get_count(enc[1], &raw[1]);
         const int64_t now = esp_timer_get_time();
-        float dt = (float)(now - previous_us) / 1000000.0f;
+        const float dt = (float)(now - previous_us) / 1000000.0f;
         previous_us = now;
-        if (dt <= 0.0f) dt = CTRL_PERIOD_MS / 1000.0f;
-        count[0] = raw[0];
-        count[1] = -raw[1];
-        for (int i = 0; i < 2; ++i) {
-            const int step = count[i] - previous[i];
-            previous[i] = count[i];
-            const float instantaneous = step * 60.0f / (ENCODER_CPR * dt);
-            filtered[i] = 0.7f * filtered[i] + 0.3f * instantaneous;
+        const bool sample_valid = a == ESP_OK && b == ESP_OK && raw[1] != INT_MIN;
+        const bool timing_valid = dt > 0.0f && dt <= 0.1f;
+        bool no_ticks = true;
+        bool overspeed = false;
+        if (sample_valid) {
+            count[0] = raw[0];
+            count[1] = -raw[1];
+            for (int i = 0; i < 2; ++i) {
+                const int64_t step = (int64_t)count[i] - previous[i];
+                previous[i] = count[i];
+                no_ticks = no_ticks && step == 0;
+                if (timing_valid) {
+                    const float instantaneous = step * 60.0f / (ENCODER_CPR * dt);
+                    filtered[i] = 0.7f * filtered[i] + 0.3f * instantaneous;
+                    overspeed = overspeed || fabsf(filtered[i]) > MAX_MEASURED_RPM;
+                }
+            }
         }
 
-        bool report = false, fault = false;
+        bool report = false;
         app_state_t snapshot = {0};
         lock_state();
+        const char *prior_fault = st.fault_reason;
         for (int i = 0; i < 2; ++i) {
             st.measured[i] = filtered[i];
             st.ticks[i] = count[i];
         }
-        const bool expired = st.armed && now > st.arm_deadline_us;
-        const bool heartbeat_lost = st.active && (now - st.last_command_us > HEARTBEAT_US);
-        const bool sample_late = dt > 0.1f; // Missed several control cycles.
-        if (a != ESP_OK || b != ESP_OK || expired || heartbeat_lost || sample_late) {
-            if (st.active) { st.control_faults++; fault = true; }
-            stop_all_locked();
+        check_deadlines_locked(esp_timer_get_time());
+        if (!sample_valid) latch_fault_locked("ENCODER", false);
+        else if (!timing_valid) latch_fault_locked("TIMING", false);
+        else if (overspeed) latch_fault_locked("OVERSPEED", false);
+
+        if (st.active || !sample_valid || !timing_valid || !no_ticks ||
+            fabsf(filtered[0]) >= STATIONARY_RPM || fabsf(filtered[1]) >= STATIONARY_RPM) {
+            st.quiet_since_us = 0;
+            st.stationary = false;
+        } else {
+            if (!st.quiet_since_us) st.quiet_since_us = now;
+            st.stationary = now - st.quiet_since_us >= STATIONARY_US;
         }
         // Outer loop is deliberately OFF for reverse, turning, unequal wheel setpoints,
         // very slow/fast test motions, or whenever the motors are not active.
@@ -315,14 +370,12 @@ static void control_task(void *arg)
                 sync_epoch = st.motion_epoch;
                 sync_tracking = true;
             }
-            const int32_t left_delta = count[0] - sync_start[0];
-            const int32_t right_delta = count[1] - sync_start[1];
+            const int64_t left_delta = (int64_t)count[0] - sync_start[0];
+            const int64_t right_delta = (int64_t)count[1] - sync_start[1];
             // When right is ahead, speed up left slightly and slow down right.
-            const int32_t error_ticks = right_delta - left_delta;
+            const int64_t error_ticks = right_delta - left_delta;
             if (error_ticks > SYNC_MAX_ERROR_TICKS || error_ticks < -SYNC_MAX_ERROR_TICKS) {
-                st.control_faults++;
-                fault = true;
-                stop_all_locked();  // Fail safe on unexpected encoder disagreement.
+                latch_fault_locked("ENCODER_SYNC", false);
                 sync_tracking = false;
                 sync_corr_rpm = 0.0f;
             } else {
@@ -345,11 +398,20 @@ static void control_task(void *arg)
             st.sync_correction_rpm = 0.0f;
         }
 #endif
+        if (pi_epoch != st.motion_epoch) {
+            pi_epoch = st.motion_epoch;
+            for (int i = 0; i < 2; ++i) {
+                integral[i] = duty_last[i] = 0;
+                stall_ms[i] = 0;
+                no_progress_since[i] = 0;
+            }
+        }
         if (st.active) {
             for (int i = 0; i < 2; ++i) {
                 const float ref = effective_ref[i];
                 if (fabsf(ref) < 0.1f) {
                     integral[i] = 0; duty_last[i] = 0; stall_ms[i] = 0;
+                    no_progress_since[i] = 0;
                     motor_disable_one_locked(i);
                     continue;
                 }
@@ -366,13 +428,17 @@ static void control_task(void *arg)
                 const float duty = limitf(desired_duty, fmaxf(0.0f, duty_last[i] - DUTY_RAMP_PER_TICK),
                                            duty_last[i] + DUTY_RAMP_PER_TICK);
                 duty_last[i] = duty;
-                if (fabsf(filtered[i]) > MAX_MEASURED_RPM) {
-                    st.control_faults++; fault = true; stop_all_locked(); break;
-                }
                 if (duty > 35.0f && fabsf(filtered[i]) < 1.0f) stall_ms[i] += CTRL_PERIOD_MS;
                 else stall_ms[i] = 0;
-                if (stall_ms[i] >= 800) {
-                    st.control_faults++; fault = true; stop_all_locked(); break;
+                // At low targets, feedforward and PI may never reach 35% duty.
+                // Require measured progress in the commanded direction in continuous mode.
+                if (!no_progress_since[i] || measured_along_command >= STATIONARY_RPM) {
+                    no_progress_since[i] = now;
+                }
+                if (stall_ms[i] >= 800 ||
+                    (st.continuous && now - no_progress_since[i] >= STALL_TIMEOUT_US)) {
+                    latch_fault_locked("STALL", false);
+                    break;
                 }
                 motor_apply_locked(i, ref, duty, now);
             }
@@ -386,6 +452,7 @@ static void control_task(void *arg)
             for (int i = 0; i < 2; ++i) {
                 integral[i] = duty_last[i] = 0;
                 stall_ms[i] = 0;
+                no_progress_since[i] = 0;
                 motor_disable_one_locked(i);
             }
         }
@@ -394,8 +461,9 @@ static void control_task(void *arg)
             snapshot = st;
             report = true;
         }
+        const char *new_fault = prior_fault ? NULL : st.fault_reason;
         unlock_state();
-        if (fault) ESP_LOGW(TAG, "CONTROL STOP: deadline, heartbeat, PCNT, stall or timing fault");
+        if (new_fault) ESP_LOGW(TAG, "CONTROL FAULT: %s", new_fault);
         if (report) ESP_LOGI(TAG,
             "armed=%d active=%d | L ref=%+.1f act=%+.1f duty=%.1f ticks=%ld | R ref=%+.1f act=%+.1f duty=%.1f ticks=%ld | SYNC=%d e=%ld corr=%+.2f",
             snapshot.armed, snapshot.active,
@@ -417,6 +485,91 @@ static bool seq_test_frame(const char *s, size_t n)
     return true;
 }
 
+static void uart_fault(const char *reason)
+{
+    lock_state();
+    latch_fault_locked(reason, true);
+    unlock_state();
+}
+
+#if ENABLE_CLOSED_LOOP_TEST
+static const char *arm_locked(bool continuous, int64_t now)
+{
+    check_deadlines_locked(now);
+    if (st.fault_reason) return "ERR FAULT\r\n";
+    if (st.active || (st.armed && (continuous || st.continuous))) return "ERR BUSY\r\n";
+    if (continuous && !st.stationary) return "ERR NOT_STATIONARY\r\n";
+    st.armed = true;
+    st.continuous = continuous;
+    st.arm_deadline_us = now + ARM_WINDOW_US;
+    return continuous ? "OK ARMED CONT\r\n" : "OK ARMED 5S\r\n";
+}
+
+static const char *velocity_locked(float left, float right, int64_t now)
+{
+    check_deadlines_locked(now);
+    if (st.fault_reason) return "ERR FAULT\r\n";
+
+    float target[] = {left, right};
+    for (int i = 0; i < 2; ++i) {
+        // Retain the legacy bench deadband while explicitly rejecting every
+        // unsupported nonzero continuous-mode setpoint.
+        if (!st.continuous && fabsf(target[i]) <= 0.1f) target[i] = 0;
+        if (target[i] != 0 && fabsf(target[i]) < MIN_SETPOINT_RPM) {
+            latch_fault_locked("LOW_SPEED", false);
+            return "ERR LOW_SPEED\r\n";
+        }
+    }
+    if (target[0] == 0 && target[1] == 0) {
+        stop_all_locked();
+        return "OK V\r\n";
+    }
+    if (!st.armed) return "ERR NOT_ARMED\r\n";
+#if !ALLOW_DUAL_WHEEL_TEST
+    if (target[0] != 0 && target[1] != 0) {
+        latch_fault_locked("SINGLE_WHEEL_ONLY", false);
+        return "ERR SINGLE_WHEEL_ONLY\r\n";
+    }
+#endif
+    if (st.continuous && !st.active && !st.stationary) {
+        latch_fault_locked("NOT_STATIONARY", false);
+        return "ERR NOT_STATIONARY\r\n";
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (target[i] != 0 && st.last_direction[i] * target[i] < 0 &&
+            (st.active || !st.stationary)) {
+            latch_fault_locked("REVERSAL", false);
+            return "ERR STOP_BEFORE_REVERSE\r\n";
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        st.target[i] = target[i];
+        if (target[i] != 0) st.last_direction[i] = target[i] > 0 ? 1 : -1;
+    }
+    st.stationary = false;
+    st.quiet_since_us = 0;
+    st.last_command_us = now;
+    st.active = true;
+    return "OK V\r\n";
+}
+#endif
+
+static bool parse_velocity(const char *line, float *left, float *right)
+{
+    const char *start = line + 2;
+    char *end;
+    errno = 0;
+    *left = strtof(start, &end);
+    if (end == start || *end != ' ' || errno == ERANGE || !isfinite(*left)) return false;
+
+    start = end + 1;
+    errno = 0;
+    *right = strtof(start, &end);
+    if (end == start || errno == ERANGE || !isfinite(*right)) return false;
+    while (*end == ' ') end++;
+    return *end == '\0';
+}
+
 static void process_line(char *line, size_t n)
 {
     if (seq_test_frame(line, n)) {
@@ -430,78 +583,63 @@ static void process_line(char *line, size_t n)
         send_uart("OK STOP\r\n");
         return;
     }
+    if (!strcmp(line, "VER")) {
+        send_uart("VERSION PV=3 CAP=ARM_CONT,STICKY_FAULT,STATIONARY,BOOT_ID\r\n");
+        return;
+    }
     if (!strcmp(line, "Q")) {
         app_state_t s;
-        lock_state(); s = st; unlock_state();
-        char out[192];
-        snprintf(out, sizeof(out), "STATUS A=%d RUN=%d L=%+.1f/%+.1f DL=%.1f TL=%ld R=%+.1f/%+.1f DR=%.1f TR=%ld UE=%lu CF=%lu\r\n",
+        lock_state();
+        check_deadlines_locked(esp_timer_get_time());
+        s = st;
+        unlock_state();
+        char out[256];
+        snprintf(out, sizeof(out),
+                 "STATUS A=%d RUN=%d L=%+.1f/%+.1f DL=%.1f TL=%ld R=%+.1f/%+.1f DR=%.1f TR=%ld UE=%lu CF=%lu"
+                 " MODE=%s FL=%d FR=%s ST=%d BOOT=%08lx\r\n",
                  s.armed, s.active, s.target[0], s.measured[0], s.duty[0], (long)s.ticks[0],
                  s.target[1], s.measured[1], s.duty[1], (long)s.ticks[1],
-                 (unsigned long)s.uart_errors, (unsigned long)s.control_faults);
+                 (unsigned long)s.uart_errors, (unsigned long)s.control_faults,
+                 s.armed ? (s.continuous ? "CONT" : "LEGACY") : "IDLE",
+                 s.fault_reason != NULL, s.fault_reason ? s.fault_reason : "NONE",
+                 s.stationary, (unsigned long)boot_id);
         send_uart(out);
         return;
     }
-    if (!strcmp(line, "ARM")) {
+    if (!strcmp(line, "ARM") || !strcmp(line, "ARM_CONT")) {
 #if ENABLE_CLOSED_LOOP_TEST
         lock_state();
-        bool busy = st.active;
-        if (!busy) {
-            st.armed = true;
-            st.arm_deadline_us = esp_timer_get_time() + ARM_WINDOW_US;
-        }
+        const char *reply = arm_locked(!strcmp(line, "ARM_CONT"), esp_timer_get_time());
         unlock_state();
-        send_uart(busy ? "ERR BUSY\r\n" : "OK ARMED 5S\r\n");
+        send_uart(reply);
 #else
         send_uart("ERR TEST_DISABLED\r\n");
 #endif
         return;
     }
-    if (n >= 3 && line[0] == 'V' && line[1] == ' ') {
-        float l = 0, r = 0;
-        int end = 0;
-        if (sscanf(line, "V %f %f %n", &l, &r, &end) != 2 || end != (int)n ||
-            !isfinite(l) || !isfinite(r) || fabsf(l) > MAX_SETPOINT_RPM || fabsf(r) > MAX_SETPOINT_RPM ||
-            (fabsf(l) > 0.1f && fabsf(l) < 5.0f) || (fabsf(r) > 0.1f && fabsf(r) < 5.0f)) {
-            lock_state(); stop_all_locked(); unlock_state();
-            send_uart("ERR BAD_V\r\n"); return;
+    if (n >= 2 && line[0] == 'V' && line[1] == ' ') {
+        float l, r;
+        if (!parse_velocity(line, &l, &r)) {
+            uart_fault("BAD_V");
+            send_uart("ERR BAD_V\r\n");
+            return;
         }
-#if !ENABLE_CLOSED_LOOP_TEST
-        send_uart("ERR TEST_DISABLED\r\n");
-#else
-#if !ALLOW_DUAL_WHEEL_TEST
-        if (fabsf(l) > 0.1f && fabsf(r) > 0.1f) {
-            lock_state(); stop_all_locked(); unlock_state();
-            send_uart("ERR SINGLE_WHEEL_ONLY\r\n"); return;
+        if (fabsf(l) > MAX_SETPOINT_RPM || fabsf(r) > MAX_SETPOINT_RPM) {
+            lock_state(); latch_fault_locked("SETPOINT_RANGE", false); unlock_state();
+            send_uart("ERR BAD_V\r\n");
+            return;
         }
-#endif
-        const int64_t now = esp_timer_get_time();
+#if ENABLE_CLOSED_LOOP_TEST
         lock_state();
-        if (!st.armed || now > st.arm_deadline_us) {
-            stop_all_locked();
-            unlock_state();
-            send_uart("ERR NOT_ARMED\r\n");
-            return;
-        }
-        bool reversal = false;
-        if (st.active) {
-            if ((st.target[0] * l < -0.01f) || (st.target[1] * r < -0.01f)) reversal = true;
-        }
-        if (reversal) {
-            stop_all_locked(); unlock_state();
-            send_uart("ERR STOP_BEFORE_REVERSE\r\n");
-            return;
-        }
-        st.target[0] = fabsf(l) < 0.1f ? 0.0f : l;
-        st.target[1] = fabsf(r) < 0.1f ? 0.0f : r;
-        st.last_command_us = now;
-        st.active = fabsf(st.target[0]) > 0.1f || fabsf(st.target[1]) > 0.1f;
-        if (!st.active) stop_all_locked();
+        const char *reply = velocity_locked(l, r, esp_timer_get_time());
         unlock_state();
-        send_uart("OK V\r\n");
+        send_uart(reply);
+#else
+        send_uart("ERR TEST_DISABLED\r\n");
 #endif
         return;
     }
-    lock_state(); stop_all_locked(); unlock_state();
+    uart_fault("COMMAND");
     send_uart("ERR COMMAND\r\n");
 }
 
@@ -516,8 +654,8 @@ static void uart_task(void *arg)
     for (;;) {
         if (xQueueReceive(uart_events, &e, pdMS_TO_TICKS(10))) {
             if (e.type == UART_FIFO_OVF || e.type == UART_BUFFER_FULL ||
-                e.type == UART_FRAME_ERR || e.type == UART_PARITY_ERR) {
-                lock_state(); st.uart_errors++; stop_all_locked(); unlock_state();
+                e.type == UART_FRAME_ERR || e.type == UART_PARITY_ERR || e.type == UART_BREAK) {
+                uart_fault("UART_HW");
                 uart_flush_input(UART_PORT);
                 xQueueReset(uart_events);
                 used = 0; overflow = false;
@@ -529,34 +667,40 @@ static void uart_task(void *arg)
                     uint8_t data[64];
                     size_t want = unread > sizeof(data) ? sizeof(data) : unread;
                     int got = uart_read_bytes(UART_PORT, data, want, pdMS_TO_TICKS(20));
-                    if (got <= 0) break;
+                    if (got <= 0) {
+                        uart_fault("UART_RX");
+                        used = 0;
+                        overflow = true;
+                        last_byte = esp_timer_get_time();
+                        break;
+                    }
                     unread -= (size_t)got;
                     for (int i = 0; i < got; i++) {
                         const int64_t now = esp_timer_get_time();
-                        if (used && now - last_byte > FRAME_GAP_US) {
-                            used = 0; overflow = false;
-                            lock_state(); st.uart_errors++; stop_all_locked(); unlock_state();
+                        if ((used || overflow) && now - last_byte > FRAME_GAP_US) {
+                            used = 0; overflow = true;
+                            uart_fault("FRAME_GAP");
                             ESP_LOGW(TAG, "UART partial frame expired, motor disabled");
                         }
                         last_byte = now;
                         uint8_t b = data[i];
                         if (b == '\r' || b == '\n') {
                             if (overflow) {
-                                lock_state(); st.uart_errors++; stop_all_locked(); unlock_state();
-                                send_uart("ERR FRAME_OVERFLOW\r\n");
+                                send_uart("ERR FRAME\r\n");
                             } else if (used > 0) {
                                 frame[used] = 0;
                                 process_line(frame, used);
                             }
                             used = 0; overflow = false;
                         } else if (b < 0x20 || b > 0x7e) {
-                            used = 0; overflow = false;
-                            lock_state(); st.uart_errors++; stop_all_locked(); unlock_state();
+                            used = 0; overflow = true;
+                            uart_fault("BAD_BYTE");
                             send_uart("ERR BAD_BYTE\r\n");
                         } else if (!overflow && used < FRAME_MAX) {
                             frame[used++] = (char)b;
-                        } else {
+                        } else if (!overflow) {
                             overflow = true;
+                            uart_fault("FRAME_OVERFLOW");
                         }
                     }
                 }
@@ -564,7 +708,7 @@ static void uart_task(void *arg)
         }
         if (used && esp_timer_get_time() - last_byte > FRAME_GAP_US) {
             used = 0; overflow = false;
-            lock_state(); st.uart_errors++; stop_all_locked(); unlock_state();
+            uart_fault("FRAME_GAP");
             ESP_LOGW(TAG, "UART frame timeout (no CR/LF), motors stopped");
         }
     }
@@ -593,14 +737,15 @@ void app_main(void)
     enc[0] = encoder_init(4, 5);
     enc[1] = encoder_init(6, 7);
     motor_hw_init();
+    boot_id = esp_random();
     uart_init();
     if (xTaskCreate(control_task, "amr_pi_control", 6144, NULL, 7, NULL) != pdPASS) abort();
-    ESP_LOGI(TAG, "Phase 4F: dual-wheel PI plus bounded forward-straight encoder sync (optional)");
+    ESP_LOGI(TAG, "Phase 4L.1: guarded continuous bench mode");
     ESP_LOGI(TAG, "Straight sync enabled=%d, kp=%.4f RPM/tick, cap=%.1f RPM",
         ENABLE_STRAIGHT_SYNC, (double)SYNC_KP_RPM_PER_TICK, (double)SYNC_MAX_CORR_RPM);
     ESP_LOGI(TAG, "PCNT x4 CPR=3960; L forward=LPWM; R forward=RPWM; UART1=57600");
 #if ENABLE_CLOSED_LOOP_TEST
-    ESP_LOGW(TAG, "BENCH first: ARM then repeated V; raise wheels, verify fuse + physical E-stop");
+    ESP_LOGW(TAG, "BENCH: raise wheels, verify fuse and physical E-stop before ARM or ARM_CONT");
 #else
     ESP_LOGW(TAG, "BENCH PI TEST DISABLED, motors remain OFF. Change ENABLE_CLOSED_LOOP_TEST to 1 after checks");
 #endif
