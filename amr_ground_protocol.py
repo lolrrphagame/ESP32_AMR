@@ -123,6 +123,24 @@ def command_qos():
                       durability=DurabilityPolicy.VOLATILE, lifespan=Duration(seconds=DEADMAN_S))
 
 
+def status_qos(*, publisher=False):
+    # Keep the live QoS policies. A reliable writer is compatible with the
+    # best-effort reader, but that match does not guarantee delivery.
+    return 10 if publisher else command_qos()
+
+
+def arrival_monotonic(received_ns, wall_ns, now):
+    return now - (wall_ns - received_ns) / NS
+
+
+def inspect_publishers(node, topic, metrics=None):
+    started = time.monotonic() if metrics else None
+    endpoints = graph_publishers(node, topic)
+    if metrics:
+        metrics.sample('graph_inspection_ms', (time.monotonic() - started) * 1000)
+    return endpoints
+
+
 def metadata_executor():
     """Humble 3.3.x takes (message, info) but normally discards info.
 
@@ -138,23 +156,36 @@ def metadata_executor():
     class MetadataExecutor(SingleThreadedExecutor):
         def __init__(self):
             super().__init__()
-            self.with_metadata = set()
+            self.with_metadata = {}
 
-        def subscribe(self, node, msg_type, topic, callback, qos):
+        def subscribe(self, node, msg_type, topic, callback, qos, *, metrics=None, channel=None):
             sub = node.create_subscription(msg_type, topic, callback, qos)
-            self.with_metadata.add(sub)
+            self.with_metadata[sub] = (metrics, channel)
             return sub
 
         def _take_subscription(self, sub):
             if sub not in self.with_metadata:
                 return super()._take_subscription(sub)
             with sub.handle:
-                return sub.handle.take_message(sub.msg_type, sub.raw)
+                result = sub.handle.take_message(sub.msg_type, sub.raw)
+            metrics, channel = self.with_metadata[sub]
+            if result is not None and metrics:
+                metrics.event(channel + '_taken')
+            return result
+
+        def take_pending(self, sub):
+            """Take at most one pending sample before a timer declares timeout."""
+            result = self._take_subscription(sub)
+            if result is not None:
+                self._dispatch(sub, result)
+
+        def _dispatch(self, sub, result):
+            sub.callback(result[0], result[1] if len(result) == 2 else None)
 
         async def _execute_subscription(self, sub, result):
             if sub not in self.with_metadata:
                 await super()._execute_subscription(sub, result)
             elif result is not None:
-                sub.callback(result[0], result[1] if len(result) == 2 else None)
+                self._dispatch(sub, result)
 
     return MetadataExecutor()

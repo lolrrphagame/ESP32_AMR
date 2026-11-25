@@ -507,3 +507,144 @@ pair, odometry, local path and progress state before changing parameters or
 accepting any goal result. The raised-wheel 2–5 RPM data and the new offline
 tests do not establish floor traction, tracking, reverse performance or
 autonomous safety.
+
+## Phase 4L.6D.4 link fault investigation
+
+The failed source-loss CSV records a bridge fault in `WAIT_READY`, before
+the first arm. The firmware was idle, had zero PWM and reported no firmware
+fault. The CSV has a single status sample from that session, so it does not
+show where the preceding status samples or clock replies were delayed.
+
+### Confirmed software failure paths
+
+- **Probe-dependent liveness.** Baseline `318a3b5` returns from the status
+  callback before updating liveness when a status lacks a clock probe. A
+  controlled replay of valid same-session statuses at 61 ms intervals,
+  without probes, reproduces `bridge status stream lost`. Status and probe
+  are now validated separately. Fresh, authorized status can maintain
+  telemetry liveness. Only a valid four-timestamp exchange can renew
+  clock authority.
+- **Executor ordering.** On the installed Humble executor, the wait set
+  yields ready timers before ready subscriptions on the same node. The
+  metadata override preserves that order. An isolated ROS regression
+  confirms it with a pending String sample. The baseline watchdog then
+  reproduces the false timeout if a valid status arrived at 205 ms and the
+  timer runs first at 240 ms. At the deadline boundary the adapter now takes
+  at most one pending status before declaring timeout. The bridge uses the
+  same bounded check for pending clock replies. A baseline replay also
+  reproduced clock expiry when a valid reply arrived about 982 ms after the
+  previous proof and was processed 40 ms later. Only a validated DDS
+  receipt before the applicable deadline can prevent the fault. Samples
+  received after a real gap, expired proofs and stale callback data still
+  fail closed. Receipt time is tracked separately from processing time.
+- **Repeated graph work.** Each baseline adapter status callback queries
+  both the raw source graph and the bridge status graph. Status processing
+  now checks the status writer only. The regular adapter timer and the raw
+  callback still check both endpoints, including immediately before
+  forwarding any motion sample. Commissioning bridge control and velocity
+  callbacks retain endpoint checks. The eliminated lookup was redundant.
+  No field measurements attribute the fault to graph cost.
+
+The hardware trigger remains unconfirmed. The reliable status writer and
+best-effort depth-one reader can communicate, but a matched reader can still
+lose a sample or replace a pending sample. Status QoS is preserved to avoid
+adding reliable-reader backpressure to the bridge. Bridge timers and
+subscriptions share one thread. Commissioning adds graph inspection, clock
+handling and, during drive, UART work relative to read-only operation.
+A delayed callback, executor or OS scheduling, slow UART transactions
+and DDS or network delays must be distinguished using an instrumented
+commissioning run. An ICMP ping measures a different path. The reported
+healthy read-only timing cannot rule out commissioning stalls.
+
+The 230 ms status deadline, 230 ms motion deadman and command freshness
+checks, ±20 ms clock bounds, one-second proof lifetime and independent
+300 ms firmware heartbeat are preserved. A real gap or validation failure
+still latches a fault. The diagnostic code requires an explicit option on
+the live bridge or adapter and never clears a fault.
+
+### Deploy and run the isolated link check
+
+Stop existing test participants, then copy the same updated Python sources
+to both hosts. For an existing checkout on `robot1`, run from the laptop's
+updated checkout.
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+scp amr_ground_protocol.py amr_link_metrics.py amr_ros2_bridge_v3_2.py robot1:~/amr_phase_v3_work/ESP32_AMR/
+scp tools/amr_cmd_vel_adapter.py tools/amr_link_diagnostics.py robot1:~/amr_phase_v3_work/ESP32_AMR/tools/
+```
+
+Use an unused isolated ROS domain and matching diagnostic session on the
+trusted laptop/Pi LAN. Start the bridge side first and launch the adapter
+within 15 seconds. Choose a new session and output names for each run.
+The diagnostic never opens UART or publishes velocity. It advertises an
+unused stamped endpoint inside its diagnostic topic prefix so the real
+ownership/discovery checks still run. This test exercises the middleware
+link and clock exchange without simulating UART workload. At the end of a healthy run, the adapter sends a
+diagnostic-only completion marker so deliberate teardown can be separated
+from publisher disappearance during the measurement.
+
+On the Raspberry Pi:
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+source /opt/ros/humble/setup.bash
+export ROS_LOCALHOST_ONLY=0
+SESSION=6845d0bd00000000000000000000000d
+python3 -B tools/amr_link_diagnostics.py bridge --domain-id 184 --session "$SESSION" --duration 145 --json ./link-pi.json
+```
+
+On the laptop:
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+source /opt/ros/humble/setup.bash
+export ROS_LOCALHOST_ONLY=0
+SESSION=6845d0bd00000000000000000000000d
+python3 -B tools/amr_link_diagnostics.py adapter --domain-id 184 --session "$SESSION" --duration 120 --json ./link-laptop.json
+```
+
+To verify that a real gap still faults, repeat on a new diagnostic session
+and give the mock bridge `--pause-status-at 10 --pause-status-for .45`.
+Once authority is established, expect nonzero exit and the observed fault
+in each JSON. This is a deliberately failing diagnostic scenario.
+
+For a separately authorized commissioning investigation, use the existing
+raised-wheel commands in this README and append `--link-diagnostics` to
+both V3.2 and the adapter. Leave the raw motion publisher off to compare
+stationary commissioning against the isolated test. These processes emit
+at most one periodic summary per ten seconds through an asynchronous
+single-item queue and a final summary after cleanup. Percentiles use the
+latest 4,096 samples per metric, while maxima and counts are lifetime
+values. Inspect the bridge and adapter reports together.
+
+`status_published` and sequence gaps describe the producer and the samples
+visible to Python. `status_taken` counts samples dequeued from DDS,
+`status_callbacks` counts callbacks entered, and the adapter reports
+accepted, ignored and rejected dispositions. The DDS receipt-to-callback
+delay identifies samples that reached the local middleware but waited for
+Python. If nothing was taken, comparing the two profiles can narrow the
+failure, but a sequence gap alone cannot distinguish delivery loss from
+a replaced depth-one sample. Missing metadata is recorded as JSON null.
+Timer delay is measured against nominal cadence on the local monotonic
+clock. Offset bounds and round-trip measurements use the real clock probe
+timestamps.
+
+### Offline verification commands
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+source /opt/ros/humble/setup.bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+PYTHONPYCACHEPREFIX=$(mktemp -d) python3 -m py_compile amr_ground_protocol.py amr_link_metrics.py amr_ros2_bridge_v3_2.py tools/amr_cmd_vel_adapter.py tools/amr_link_diagnostics.py tests/test_amr_link_diagnostics.py
+```
+
+Verified locally with Humble. All 83 Python tests passed with zero failures
+or skips. Syntax checks and the existing native policy test passed. The
+120-second localhost diagnostic accepted all 1,999 taken status samples
+and verified 780 clock proofs. The maximum DDS status interval was
+61.23 ms, with p95 of 60.34 ms. A separate injected 450 ms status pause
+latched the adapter at an observed 262.75 ms timeout age and propagated
+the fault to the mock bridge. The localhost runs used no UART or motion
+traffic. A cross-host stationary commissioning capture is still needed
+to identify the field trigger.

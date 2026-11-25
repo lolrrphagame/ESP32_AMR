@@ -426,8 +426,9 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(len(self.out), 1)
         self.assertEqual(self.out[0][1].source_ns, info['source_timestamp'])
         self.assertEqual(self.out[0][1].receipt_ns, info['received_timestamp'])
-        self.clock.seconds += DEADMAN_S + .01
+        self.clock.seconds += .12
         self.status()
+        self.clock.seconds += DEADMAN_S + .01 - .12
         self.adapter.tick()
         self.assertIn('arrival gap', self.adapter.fault_reason)
         self.adapter.sample(value, dds(self.clock.wall()))
@@ -436,7 +437,9 @@ class AdapterTest(unittest.TestCase):
     def test_fresh_input_after_missed_deadline_cannot_renew_adapter(self):
         self.status()
         self.adapter.sample(twist(), dds(self.clock.wall()))
-        self.clock.seconds += DEADMAN_S + .01
+        self.clock.seconds += .12
+        self.status()
+        self.clock.seconds += DEADMAN_S + .01 - .12
         self.adapter.sample(twist(), dds(self.clock.wall()))
         self.assertEqual(len(self.out), 1)
         self.assertIn('arrival gap', self.adapter.fault_reason)

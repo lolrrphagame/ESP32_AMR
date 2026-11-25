@@ -6,12 +6,15 @@ import json
 import math
 import secrets
 import sys
+import time
 
 from amr_ground_protocol import (
     CLOCK_OFFSET_NS, CLOCK_PROOF_S, CONTROL_TOPIC, DEADMAN_NS, DISCOVERY_S, GROUND_TOPIC,
     NS, SOURCE_TOPICS, STATUS_TOPIC, AuthorityError, CommandStamp, DDSStamp, WallClockGuard,
-    check_dds_publisher, clock_proven, command_qos, graph_publishers, metadata_executor, token_valid,
+    arrival_monotonic, check_dds_publisher, clock_proven, command_qos, inspect_publishers,
+    metadata_executor, status_qos, token_valid,
 )
+from amr_link_metrics import LinkMetrics, PeriodicLinkReport, summarize
 from amr_ros2_bridge_v3 import (
     CPR, DEADMAN_S, LOOP_PERIOD_S, MAX_ANGULAR_RPS, MAX_LINEAR_MPS, MAX_WHEEL_RPM,
     MIN_ACTIVE_RPM, SESSION_MAX_S, SESSION_STOP_MARGIN_S, WHEEL_SEPARATION_M,
@@ -58,7 +61,7 @@ class Limits:
 
 
 class BridgeV32(BridgeV31):
-    def __init__(self, uart, commissioning=None, source=None, duration=None, limits=Limits(), **kwargs):
+    def __init__(self, uart, commissioning=None, source=None, duration=None, limits=Limits(), *, metrics=None, **kwargs):
         if commissioning not in (None, 'raised', 'ground') or (
                 commissioning is None and (source is not None or duration is not None)):
             raise ValueError('a source and duration can only be selected for commissioning')
@@ -73,6 +76,7 @@ class BridgeV32(BridgeV31):
         self.duration = SESSION_MAX_S if commissioning == 'raised' else (
             (duration if duration is not None else GROUND_DEFAULT_S) if commissioning else None)
         self.limits = limits
+        self.metrics = metrics
         self.session = secrets.token_hex(16) if commissioning else None
         self.clock = WallClockGuard(self.now, self.wall_ns)
         self.challenges = {}
@@ -157,21 +161,36 @@ class BridgeV32(BridgeV31):
             self.latch(str(exc))
             return None
         now = self.now()
+        # Retain enough history for a timely response that waited in DDS.
+        # Both ingress age and callback age are still checked independently.
         self.challenges = {key: when for key, when in self.challenges.items()
-                           if now - when < DEADMAN_S}
+                           if now - when < 2 * DEADMAN_S}
         self.challenges[t1] = now
         return t1
+
+    def latch(self, reason):
+        if self.metrics and self.state != State.FAULT_LATCHED:
+            latest = self.metrics.latest
+            latest.update(fault_reason=reason, fault_clock_proof_age_s=self.clock_proof_age(),
+                          fault_control_timestamps=latest.get('control_timestamps'),
+                          fault_command_age_s=(self.now() - self.command_at
+                                               if self.command_at is not None else None))
+        super().latch(reason)
+
+    def clock_result(self, result, reason=None):
+        if self.metrics:
+            self.metrics.event('clock_' + result)
+            if reason:
+                self.metrics.event('clock_reason:' + reason)
 
     def control(self, message, info):
         if not self.commissioning or self.state == State.FAULT_LATCHED:
             return
         if (message.get('session') != self.session or message.get('source') != self.source
                 or not token_valid(message.get('activation'))):
+            self.clock_result('ignored', 'session_source_or_activation')
             return
         activation = message['activation']
-        if self.activation is not None and self.now() - self.clock_ok_at >= CLOCK_PROOF_S:
-            self.latch('ground authority clock proof expired')
-            return
         if self.activation is not None and activation != self.activation:
             self.latch('ground control activation changed')
             return
@@ -186,10 +205,15 @@ class BridgeV32(BridgeV31):
                 reason = message.get('reason')
                 self.latch('adapter fault: ' + (reason[:160] if isinstance(reason, str) else 'cancelled'))
             return
-        if kind != 'clock' or self.candidate_endpoints is None or self.now() - self.discovery_at < DISCOVERY_S:
+        if kind != 'clock':
+            return
+        if self.candidate_endpoints is None or self.now() - self.discovery_at < DISCOVERY_S:
+            self.clock_result('ignored', 'publisher_discovery')
             return
         t1, t2, t3 = (message.get(name) for name in ('t1', 't2', 't3'))
-        if type(t1) is not int or self.now() - self.challenges.pop(t1, -math.inf) >= DEADMAN_S:
+        challenge_at = self.challenges.pop(t1, None) if type(t1) is int else None
+        if challenge_at is None:
+            self.clock_result('failure', 'unknown_or_expired_probe')
             return
         try:
             wall = self.clock.check()
@@ -199,22 +223,48 @@ class BridgeV32(BridgeV31):
             sent, received = info.get('source_timestamp'), info.get('received_timestamp')
             if (type(sent) is not int or type(received) is not int or type(t3) is not int
                     or not 0 <= sent - t3 < CLOCK_OFFSET_NS
-                    or not 0 <= wall - received < DEADMAN_NS
-                    or not clock_proven(t1, t2, t3, received)):
-                raise AuthorityError('laptop/Pi clock offset or network delay unverified')
-        except AuthorityError:
+                    or not 0 <= wall - received < DEADMAN_NS):
+                raise AuthorityError('invalid clock response DDS metadata')
+            received_at = arrival_monotonic(received, wall, self.now())
+            if not 0 <= received_at - challenge_at < DEADMAN_S:
+                raise AuthorityError('late clock response')
+            if self.metrics and type(t2) is int and 0 < t2 < (1 << 63):
+                self.metrics.sample('clock_rtt_ms', ((received - t1) - (t3 - t2)) / 1e6)
+                self.metrics.latest['clock_offset_bounds_ms'] = [(t3 - received) / 1e6, (t2 - t1) / 1e6]
+            if not clock_proven(t1, t2, t3, received):
+                raise AuthorityError('clock offset bounds unverified')
+        except AuthorityError as exc:
+            self.clock_result('failure', str(exc))
             self.clock_status = 'CLOCK_UNVERIFIED'
             return
+        if self.clock_ok_at is not None:
+            age = received_at - self.clock_ok_at
+            if age >= CLOCK_PROOF_S:
+                self.clock_result('failure', 'proof_arrived_after_expiry')
+                if self.metrics:
+                    self.metrics.latest['timeout_age_s'] = age
+                self.latch('ground authority clock proof missing or expired')
+                return
+            if age <= 0:
+                self.clock_result('ignored', 'out_of_order_proof')
+                return
         if self.activation is None:
             self.activation = activation
             self.owner_endpoints = self.candidate_endpoints
             self.authorized_after = wall
-        self.clock_ok_at = self.now()
+        self.clock_ok_at = received_at
         self.clock_status = 'VERIFIED'
+        self.clock_result('success')
+
+    def clock_proof_age(self):
+        return self.now() - self.clock_ok_at if self.clock_ok_at is not None else None
 
     def require_authority(self):
         self.clock.check()
-        if self.clock_ok_at is None or self.now() - self.clock_ok_at >= CLOCK_PROOF_S:
+        age = self.clock_proof_age()
+        if age is None or age >= CLOCK_PROOF_S:
+            if self.metrics:
+                self.metrics.latest['timeout_age_s'] = age
             raise AuthorityError('ground authority clock proof missing or expired')
 
     def command(self, components, stamp, info):
@@ -341,7 +391,8 @@ class BridgeV32(BridgeV31):
         result.update({
             'version': '3.2', 'bridge_mode': self.commissioning or 'read-only',
             'session_id': self.session, 'authority_state': status, 'adapter_activation': self.activation,
-            'clock_status': self.clock_status, 'command_source': self.source,
+            'clock_status': self.clock_status, 'clock_proof_age_s': self.clock_proof_age(),
+            'command_source': self.source,
             'session_state': ('DISABLED' if not self.commissioning else
                               'INHIBITED' if self.state == State.FAULT_LATCHED else
                               'TIMED' if self.session_deadline is not None else 'AWAITING_FIRST_ARM'),
@@ -370,34 +421,98 @@ class BridgeV32(BridgeV31):
         return True
 
 
-def run_ros(port, commissioning, source, duration, limits):
+def attach_bridge_link(node, executor, bridge, *, status_topic=STATUS_TOPIC,
+                       ground_topic=GROUND_TOPIC, control_topic=CONTROL_TOPIC):
+    """Shared clock/status wiring for the real bridge and no-motion link probe."""
+    from std_msgs.msg import String
+
+    sequence = 0
+    metrics = bridge.metrics
+    status_pub = node.create_publisher(String, status_topic, status_qos(publisher=True))
+
+    def observe():
+        bridge.observe_publishers(inspect_publishers(node, ground_topic, metrics),
+                                  inspect_publishers(node, control_topic, metrics))
+
+    def on_control(msg, info):
+        if metrics:
+            started = time.monotonic()
+            metrics.received('control', info)
+        try:
+            observe()
+            try:
+                data = json.loads(msg.data) if len(msg.data) <= 512 else None
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                bridge.control(data, info)
+            else:
+                bridge.clock_result('ignored', 'malformed_control')
+                if bridge.activation:
+                    bridge.latch('invalid ground control message')
+        finally:
+            if metrics:
+                metrics.sample('control_callback_ms', (time.monotonic() - started) * 1000)
+
+    def before_tick():
+        observe()
+        age = bridge.clock_proof_age()
+        if bridge.state != State.FAULT_LATCHED and age is not None and age >= CLOCK_PROOF_S:
+            if metrics:
+                metrics.event('pending_control_checks')
+            executor.take_pending(control_sub)
+
+    def publish():
+        nonlocal sequence
+        sequence += 1
+        payload = bridge.status()
+        before = bridge.state
+        probe = bridge.issue_challenge()
+        if bridge.state != before:
+            payload = bridge.status()
+        payload['status_sequence'] = sequence
+        payload['clock_probe_ns'] = probe
+        status_pub.publish(String(data=json.dumps(payload, allow_nan=False)))
+        if metrics:
+            metrics.sequence(sequence)
+            metrics.event('status_published')
+            metrics.latest['last_clock_proof_age_s'] = bridge.clock_proof_age()
+
+    if bridge.commissioning:
+        control_sub = executor.subscribe(node, String, control_topic, on_control, command_qos(),
+                                         metrics=metrics, channel='control')
+    return before_tick, publish
+
+
+def run_ros(port, commissioning, source, duration, limits, diagnostics=False):
     import rclpy
     from geometry_msgs.msg import TwistStamped
     from rclpy.clock import Clock, ClockType
     from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
     from sensor_msgs.msg import JointState
-    from std_msgs.msg import String
 
     node = executor = None
     result = 0
+    metrics = None
     rclpy.init(args=[])
     try:
         executor = metadata_executor() if commissioning else SingleThreadedExecutor()
         node = rclpy.create_node('amr_serial_bridge')
         joint_pub = node.create_publisher(JointState, '/joint_states', 10)
-        status_pub = node.create_publisher(String, STATUS_TOPIC, 10)
+        metrics = LinkMetrics('bridge') if diagnostics else None
+        reporter = PeriodicLinkReport(metrics) if metrics else None
         with exclusive_uart(port) as uart:
-            bridge = BridgeV32(uart, commissioning, source, duration, limits)
+            bridge = BridgeV32(uart, commissioning, source, duration, limits, metrics=metrics)
+            before_tick, publish = attach_bridge_link(node, executor, bridge)
             try:
                 bridge.start()
 
-                def observe():
-                    bridge.observe_publishers(graph_publishers(node, GROUND_TOPIC),
-                                              graph_publishers(node, CONTROL_TOPIC))
-
                 def tick():
+                    if metrics:
+                        started = time.monotonic()
+                        metrics.timer(LOOP_PERIOD_S, started)
                     if commissioning:
-                        observe()
+                        before_tick()
                     previous = bridge.feedback
                     bridge.tick()
                     feedback = bridge.feedback
@@ -408,13 +523,13 @@ def run_ros(port, commissioning, source, duration, limits):
                         msg.position = [ticks * 2 * math.pi / CPR for ticks in feedback.ticks]
                         msg.velocity = [rpm * 2 * math.pi / 60 for rpm in feedback.measured]
                         joint_pub.publish(msg)
-                    challenge = bridge.issue_challenge()
-                    status = bridge.status()
-                    status['clock_probe_ns'] = challenge
-                    status_pub.publish(String(data=json.dumps(status, allow_nan=False)))
+                    publish()
+                    if metrics:
+                        metrics.sample('timer_execution_ms', (time.monotonic() - started) * 1000)
+                        reporter.poll()
 
                 def on_command(msg, info):
-                    observe()
+                    before_tick()
                     try:
                         stamp = CommandStamp.from_header(msg.header)
                     except AuthorityError as exc:
@@ -423,20 +538,8 @@ def run_ros(port, commissioning, source, duration, limits):
                     else:
                         bridge.command(twist_components(msg.twist), stamp, info)
 
-                def on_control(msg, info):
-                    observe()
-                    try:
-                        data = json.loads(msg.data) if len(msg.data) <= 512 else None
-                    except ValueError:
-                        data = None
-                    if isinstance(data, dict):
-                        bridge.control(data, info)
-                    elif bridge.activation:
-                        bridge.latch('invalid ground control message')
-
                 if commissioning:
                     executor.subscribe(node, TwistStamped, GROUND_TOPIC, on_command, command_qos())
-                    executor.subscribe(node, String, CONTROL_TOPIC, on_control, command_qos())
                     print(f'Session {bridge.session}, selected source {source}', flush=True)
                 node.create_timer(LOOP_PERIOD_S, tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
                 executor.add_node(node)
@@ -455,6 +558,8 @@ def run_ros(port, commissioning, source, duration, limits):
         if node is not None:
             node.destroy_node()
         rclpy.try_shutdown()
+        if metrics:
+            print(json.dumps(summarize(metrics.snapshot())), file=sys.stderr, flush=True)
     return result
 
 
@@ -469,6 +574,7 @@ def main():
     parser.add_argument('--max-linear', type=float, default=MAX_LINEAR_MPS)
     parser.add_argument('--max-angular', type=float, default=MAX_ANGULAR_RPS)
     parser.add_argument('--max-wheel-rpm', type=float, default=MAX_WHEEL_RPM)
+    parser.add_argument('--link-diagnostics', action='store_true', help='emit bounded link summaries')
     args = parser.parse_args()
     commissioning = 'ground' if args.ground_control else 'raised' if args.raised_commissioning else None
     if bool(commissioning) != bool(args.source):
@@ -494,7 +600,7 @@ def main():
         if entered.strip() != token:
             return 1
     try:
-        return run_ros(args.port, commissioning, args.source, args.session_seconds, limits)
+        return run_ros(args.port, commissioning, args.source, args.session_seconds, limits, args.link_diagnostics)
     except ImportError as exc:
         print(f'Bridge dependency unavailable: {exc}', file=sys.stderr, flush=True)
         return 1
