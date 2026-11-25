@@ -274,3 +274,236 @@ On the physical system, verify each candidate and direction, the sticky fault
 and heartbeat behaviors in LOW, stop timing and independent wheel response
 before deriving a stable minimum. Raised-wheel data alone cannot establish
 tracking under floor load or Nav2 compatibility.
+
+## Phase 4L.6C guarded ground commissioning
+
+Bridge V3.2 reuses the V3/V3.1 UART transport, firmware negotiation and STOP
+handshake. Firmware V3.1 and the existing PI and feedforward values are the
+baseline. Default V3.2 execution is `READ_ONLY`. Its motor-enabled modes are
+`--raised-commissioning` and `--ground-control`. Both use the same control path
+with `ARM_CONT`. Raised commissioning retains a 15-second budget. Ground starts
+with 10 seconds by default and accepts an explicit `--session-seconds` value
+between 1 and 120. The budget starts at the first ARM attempt and includes all
+normal stops and restarts. The bridge requests STOP 400 ms before the deadline
+to leave time for UART, the 300 ms firmware watchdog and a control tick.
+
+Use the physical cutoff and a supervisor for every commissioning run.
+Secure the stand for raised-wheel tests or clear and control the floor area
+for floor tests. These sessions establish short, human-supervised control.
+Firmware V3.1 is required for motion. The operator starts a fresh bridge
+process, selects one source, and confirms the setup before UART is opened.
+The bridge verifies idle and stationary feedback before READY and requires
+fresh input after READY. STOP bypasses the slew limiter. UART, firmware,
+authority and timing faults require an operator to end the session and
+diagnose the cause before a new activation.
+
+### Command authority and timestamps
+
+The bridge subscribes to `geometry_msgs/msg/TwistStamped` on
+`/amr_bridge/ground_cmd_vel` in enabled modes. The laptop adapter subscribes to
+one selected raw `geometry_msgs/msg/Twist` source.
+
+| Selection | Raw source topic |
+| --- | --- |
+| `teleop` | `/amr/teleop_cmd_vel` |
+| `nav2` | `/amr/nav2_cmd_vel` |
+| `commissioning` | `/amr/commissioning_cmd_vel` |
+
+The operator enters the Pi's random session ID into the adapter and confirms
+activation. The adapter binds its own activation ID, which the bridge
+accepts once. Ownership and the motion state are reported separately.
+Changing sources requires stopping and starting a new bridge and adapter
+session. ROS command queues are volatile, best-effort and depth one.
+Use one raw publisher on the selected topic. The adapter and bridge pin
+the single observed endpoints after short discovery stabilization and
+fault on publisher conflicts or changes. The control and clock-probe
+responses use `/amr_bridge/ground_control`, separate from velocity data.
+
+The installed Humble `rclpy` 3.3.22 subscription binding provides DDS source
+and receipt timestamps through the subscription handle. The standard
+executor drops those timestamps from Python callbacks. V3.2 uses a scoped
+executor override for these subscriptions. Unavailable or invalid DDS
+timestamps inhibit motion. DDS source time is the middleware publication
+event on the raw writer. An unstamped Twist still has no application-level
+creation timestamp, so any time spent in the source before its DDS publish
+remains unknown. Put the original writer and adapter on the laptop and
+verify the raw writer's publish behavior. Avoid sources that replay, hold or
+periodically republish old commands. The adapter forwards only when it takes
+a new eligible raw sample. Its stamped header carries original DDS source
+time in the commissioning metadata and raw adapter receipt time as the
+header timestamp. This topic is for the bridge and adapter, so its
+`frame_id` is control metadata rather than a TF frame.
+See the [Humble rclpy subscription binding](https://github.com/ros2/rclpy/blob/humble/rclpy/src/rclpy/subscription.cpp).
+
+Synchronize both hosts' system clocks before activation. The bridge uses a
+fresh four-timestamp round trip to bound the possible laptop/Pi offset
+within ±20 ms and requires a renewed proof within one second. It budgets
+that uncertainty against the 230 ms command deadline and checks original
+and receipt ages separately. Marked session/activation IDs and timestamps
+before the post-STOP READY boundary cannot start motion. Source silence,
+owner disappearance, expiry or cancellation stops the session. The adapter
+can send a fault notification, while the bridge deadman and firmware
+watchdog remain independent of delivery of that notification.
+
+Use only an isolated, trusted commissioning LAN with known nodes, one raw
+writer on the laptop and one adapter. The tested Humble binding exposes
+timestamps but does not provide a publisher GID on each received sample.
+Discovery endpoint counts and GIDs, process names and session IDs support
+accidental-conflict detection. They are not cryptographic authentication,
+and discovery can lag transient or spoofed participants. On middleware
+that supplies a sample GID, V3.2 also compares it to the pinned endpoint.
+Keep the bridge in READ_ONLY if the single-writer topology or source
+freshness cannot be established. A shared or adversarial network requires
+a separately secured DDS deployment and validation.
+
+### Motion admission and telemetry
+
+The maximum body targets are 0.06 m/s and 0.35 rad/s. One proportional scale
+applies both body and wheel limits. Forward pairs reserve up to 1 RPM per
+wheel for the firmware's straight synchronization, including setpoints
+encountered during slew. The effective wheel target ceiling is 15 RPM.
+Lower limits are available through `--max-linear`, `--max-angular` and
+`--max-wheel-rpm` within the firmware's 5 RPM startup constraints.
+
+Initial drive uses 5 RPM on each active wheel. Later setpoint changes use a
+15 RPM/s maximum slew. The initial step is from zero to the smallest
+supported setpoint, so startup can change heading transiently and provides
+no smooth-from-zero guarantee. The firmware keeps its existing duty ramp
+and PWM cap. A change in wheel sign or which wheels are driven requires a
+normal STOP, verified stationary READY and fresh input.
+
+An exact zero requests normal STOP. A pair containing any nonzero wheel
+below 5 RPM after limiting is inhibited in full and, while moving, causes a
+normal STOP. `LOW_SPEED_INHIBITED` is distinct from a fault. After stationary
+READY, clearing the inhibit requires at least three fresh eligible samples
+of the same wheel direction/drive pattern spanning at least 120 ms with
+each active wheel at or above 5.5 RPM. A fresh exact zero after READY allows
+the same dwell at the standard 5 RPM minimum. Any intervening sub-minimum
+request resets admission. This policy preserves the requested path ratio
+through saturation and avoids converting arbitrarily small commands into
+motion.
+
+`/amr_bridge/status` includes requested and limited body velocity
+`[m/s, rad/s]`, requested, limited, acknowledged and measured RPM, actual
+PWM, source and receipt ages, feedback age, owner and session state, time
+remaining, STOP and fault reasons, inhibition, boot ID and encoder continuity.
+`STARTING` reports a velocity acknowledgement without confirmed firmware
+RUN. `RUNNING` requires a fresh firmware Q with RUN=1. Update-time measurements
+missing from firmware remain null. `/joint_states` retains
+`left_wheel_joint` and `right_wheel_joint` with radians and radians per second.
+If the firmware boot identity changes or counts are discontinuous, V3.2
+invalidates continuity, withholds joint samples and latches a fault. Raw
+counts remain visible for diagnosis. Before resuming after such an event,
+restart odometry and re-establish localization. The existing odometry node
+does not consume the bridge continuity field.
+
+### Offline verification
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+source /opt/ros/humble/setup.bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+PYTHONPYCACHEPREFIX=$(mktemp -d) python3 -m py_compile amr_ground_protocol.py amr_ros2_bridge_v3_2.py tools/amr_cmd_vel_adapter.py tools/amr_ground_commissioning.py tests/test_amr_ground_control.py
+native_test_dir=$(mktemp -d)
+cc -std=c11 -Wall -Wextra -Werror -pedantic -I main tests/test_low_speed_policy.c -o "$native_test_dir/test_low_speed_policy"
+"$native_test_dir/test_low_speed_policy"
+```
+
+The tests use mocked UART. The installed Humble metadata regression
+publishes an isolated localhost String on a non-motion topic.
+
+### Manual commissioning commands for later supervised use
+
+On both hosts, use corresponding repository copies and the same isolated
+ROS domain. Check clock synchronization on each host.
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0
+timedatectl status
+```
+
+Start read-only on the Pi with motor power isolated. In a separate ROS
+terminal run `ros2 topic echo --once /amr_bridge/status` and check firmware
+protocol 3.1, valid encoder continuity and healthy idle feedback. Close the
+read-only process before starting an enabled bridge.
+
+```bash
+python3 -B amr_ros2_bridge_v3_2.py --port /dev/serial0
+```
+
+Start a new Pi process for a single raised profile. Confirm
+`WHEELS_UP_CUTOFF_READY` when prompted. For a later floor run, use the second
+command instead and confirm `CLEAR_AREA_CUTOFF_READY`. Use one command per run.
+
+```bash
+python3 -B amr_ros2_bridge_v3_2.py --port /dev/serial0 --raised-commissioning --source commissioning
+python3 -B amr_ros2_bridge_v3_2.py --port /dev/serial0 --ground-control --source commissioning --session-seconds 10
+```
+
+On the laptop, assign the Pi's printed session ID to `SESSION` in each
+terminal. Start a single adapter and confirm `ACTIVATE <session-id>`.
+
+```bash
+read -r SESSION
+python3 -B tools/amr_cmd_vel_adapter.py --session "$SESSION" --source commissioning
+```
+
+In another laptop terminal, run exactly one profile from the table and type
+its prompted `RUN <test> <session-id>` confirmation. Use a new CSV path and
+new bridge and adapter session for each experiment. These are separate runs.
+
+| Test selection | Pi mode | Profile |
+| --- | --- | --- |
+| `raised` | Raised | 0.04 m/s for 2 s |
+| `forward-3s` | Ground | 0.04 m/s for 3 s |
+| `forward-5s` | Ground | 0.05 m/s for 5 s |
+| `left` | Ground | +0.25 rad/s for 2 s |
+| `right` | Ground | −0.25 rad/s for 2 s |
+| `normal-stop` | Raised | 0.04 m/s for 1 s, then verify normal STOP and stationary READY |
+| `source-loss` | Raised | 0.04 m/s for 1 s, then silence and verify fault inhibition, STOP and stationary encoders |
+
+```bash
+read -r SESSION
+read -r TEST
+python3 -B tools/amr_ground_commissioning.py --test "$TEST" --session "$SESSION" --csv "./phase46c-${TEST}-${SESSION}.csv"
+```
+
+Enter the session ID and one test selection at the two `read` prompts. The
+publisher waits for the bridge to confirm stationary readiness and command
+authority. Normal profiles continue fresh zeros through the final
+stationary check. The source-loss profile stays silent and checks the
+inhibited state without sending a second motion command. Closing the
+publisher after a normal profile can cause a subsequent owner-loss fault.
+Use the CSV's final test result and the Pi's shutdown STOP and stationary
+verification. If either remains unverified, cut motor power physically.
+
+### Later Nav2 Humble integration
+
+After floor validation, prepare `nav2_navfn_planner/NavfnPlanner` with
+Regulated Pure Pursuit and forward-preferred navigation. Start evaluation
+with `desired_linear_vel: 0.05`, `rotate_to_heading_angular_vel: 0.25`,
+`allow_reversing: false`, `use_rotate_to_heading: true` and
+`use_collision_detection: true`. Keep obstacle and costmap processing
+active. Remove backup from the Behavior Server and any referenced
+`BackUp` recovery action in the chosen behavior trees until reverse
+floor motion is validated. Review the `Twist` publisher topology so a
+single final Nav2 writer is remapped to `/amr/nav2_cmd_vel`.
+See the [Humble Nav2 configuration](https://github.com/ros-navigation/navigation2/blob/humble/nav2_bringup/params/nav2_params.yaml),
+[RPP parameters](https://github.com/ros-navigation/navigation2/tree/humble/nav2_regulated_pure_pursuit_controller)
+and [default recovery tree](https://github.com/ros-navigation/navigation2/blob/humble/nav2_bt_navigator/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml).
+
+The 5 RPM threshold corresponds to about 0.0228 m/s in straight motion and
+0.152 rad/s for a symmetric in-place rotation. In curves the inside wheel
+can fall below the minimum even above the straight-line threshold. Approach
+deceleration and heading alignment can therefore request inhibited setpoints.
+Use measured floor stopping and tracking to select goal tolerances and
+rotate-to-heading settings. Allow the progress checker enough time and a
+realistic distance for these slow speeds, in-place turns and verified stop
+transitions. Humble's SimpleProgressChecker measures translational progress.
+Persistent inhibition is a navigation failure. Inspect the requested wheel
+pair, odometry, local path and progress state before changing parameters or
+accepting any goal result. The raised-wheel 2–5 RPM data and the new offline
+tests do not establish floor traction, tracking, reverse performance or
+autonomous safety.
