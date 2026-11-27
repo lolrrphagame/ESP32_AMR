@@ -3,6 +3,7 @@ import math
 import time
 import os
 import signal
+import subprocess
 import sys
 
 import rclpy
@@ -42,16 +43,32 @@ def read_odom(msg):
     global odom
     odom = msg
 
+scans_enabled = True
+scan_count = 0
+next_scan = 0.
+
 def publish():
-    global init_sent
-    if odom is None:
+    global init_sent, scan_count, next_scan
+    if odom is None or not scans_enabled:
         return
     pose = odom.pose.pose
     yaw = 2 * math.atan2(pose.orientation.z, pose.orientation.w)
     x, y = pose.position.x, pose.position.y
     scan = LaserScan()
     scan.header.frame_id = 'laser_frame'
-    scan.header.stamp = odom.header.stamp
+    now = time.monotonic()
+    if now < next_scan:
+        return
+    # 10-interval cycle averaging ~156 ms, including a 263 ms delivery gap.
+    gap = (.263, .129, .146, .145, .146, .145, .146, .145, .146, .145)[scan_count % 10]
+    next_scan += gap
+    if next_scan <= now:
+        next_scan = now + gap
+    scan_count += 1
+    duration = .256 if scan_count % 10 == 2 else .129
+    scan.scan_time = duration
+    scan.time_increment = duration / 360
+    scan.header.stamp = rclpy.time.Time(nanoseconds=time.time_ns()-round(duration*1e9)).to_msg()
     scan.angle_min = -math.pi
     scan.angle_max = math.pi
     scan.angle_increment = math.pi / 180
@@ -92,7 +109,7 @@ ex = SingleThreadedExecutor(context=ctx)
 ex.add_node(private)
 private.create_subscription(String, '/amr_bridge/status', receive, 10)
 node.create_subscription(Odometry, '/odom', read_odom, 10)
-node.create_timer(.08, publish)
+node.create_timer(.005, publish)
 spin_until(lambda: init_sent and action.server_is_ready() and status.get('stationary_ready')
            and status.get('authority_state') == 'OWNED'
            and buffer.can_transform('map', 'base_link', rclpy.time.Time()), 20)
@@ -111,6 +128,13 @@ def active():
 
 spin_until(active, 20)
 mode = sys.argv[1]
+if mode == 'goal':
+    # Public domain, same preflight CLI and callbacks as the physical workflow.
+    with subprocess.Popen([sys.executable, 'tools/amr_feedback_preflight.py', '--seconds', '3',
+                           '--amcl-tolerance', '.5'], env=dict(os.environ, ROS_LOCALHOST_ONLY='0'),
+                          stdout=subprocess.DEVNULL) as diag:
+        spin_until(lambda: diag.poll() is not None, 16)
+        assert diag.returncode == 0
 if mode == 'idle':
     # Suspend the whole ROS ingress process (including native callbacks) longer
     # than proof lifetime. The separate UDP responder must stay timely.
@@ -143,6 +167,13 @@ spin_until(sent.done, 5)
 handle = sent.result()
 assert handle.accepted
 result = handle.get_result_async()
+if mode == 'scan-loss':
+    spin_until(lambda: moving_seen, 10)
+    scans_enabled = False
+    spin_until(lambda: status.get('fault_latched') and status.get('stop_verified')
+               and not status['firmware_armed'] and status['pwm_duty_percent'] == [0., 0.], 2, expect_fault=True)
+    print('Verified stationary STOP after scan loss:', status['fault_reason'], flush=True)
+    sys.exit(0)
 if mode == 'loss':
     spin_until(lambda: moving_seen, 10)
     source_pid = int(os.environ['AMR_TEST_SOURCE_PID'])

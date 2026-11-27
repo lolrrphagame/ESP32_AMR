@@ -25,44 +25,69 @@ def valid_pose(position, rotation):
 
 
 class FeedbackWindow:
+    # Oldest scan/AMCL stamp: reported 256 ms scan time + 263 ms publication gap.
+    lifetime = dict(scan=520_000_000, localization=520_000_000, odom=300_000_000)
+
     def __init__(self, amcl_tolerance):
         self.stamps = dict(scan=0, odom=0, localization=0)
+        self.observed = {}
+        self.last_update = {}
+        self.interval_ms = {}
         self.amcl_offset = round(amcl_tolerance * NS)
 
-    def record(self, key, header, offset=0):
+    def record(self, key, header, offset=0, *, valid=True):
         ns = header.stamp.sec * NS + header.stamp.nanosec - offset
-        # Stamps on Pi-originated data include the possible interhost skew.
-        if not 0 < ns <= time.time_ns() + CLOCK_OFFSET_NS:
+        self.observed[key] = ns
+        now = time.monotonic_ns()
+        if key in self.last_update:
+            self.interval_ms[key] = (now - self.last_update[key]) / 1e6
+        self.last_update[key] = now
+        if not valid or not 0 < ns <= time.time_ns():
             self.stamps[key] = 0
         else:
             self.stamps[key] = ns
 
     def scan(self, msg):
-        if msg.header.frame_id == 'laser_frame' and msg.ranges and any(
-                math.isfinite(r) and msg.range_min <= r <= msg.range_max for r in msg.ranges):
-            self.record('scan', msg.header)
-        else:
-            self.stamps['scan'] = 0
+        valid = msg.header.frame_id == 'laser_frame' and any(
+            math.isfinite(r) and msg.range_min <= r <= msg.range_max for r in msg.ranges)
+        self.record('scan', msg.header, valid=valid)
 
     def odom(self, msg):
         pose = msg.pose.pose
-        if (msg.header.frame_id == 'odom' and msg.child_frame_id == 'base_link'
-                and valid_pose(pose.position, pose.orientation)):
-            self.record('odom', msg.header)
-        else:
-            self.stamps['odom'] = 0
+        valid = (msg.header.frame_id == 'odom' and msg.child_frame_id == 'base_link'
+                 and valid_pose(pose.position, pose.orientation))
+        self.record('odom', msg.header, valid=valid)
 
     def tf(self, msg):
         for transform in msg.transforms:
             if transform.header.frame_id == 'map' and transform.child_frame_id == 'odom':
-                if valid_pose(transform.transform.translation, transform.transform.rotation):
-                    self.record('localization', transform.header, self.amcl_offset)
-                else:
-                    self.stamps['localization'] = 0
+                self.record('localization', transform.header, self.amcl_offset,
+                            valid=valid_pose(transform.transform.translation, transform.transform.rotation))
 
     def valid_until(self):
-        # RPP transform_tolerance is 0.3 s. Account for Pi-originated stamps.
-        return min(self.stamps.values()) + 300_000_000 - CLOCK_OFFSET_NS
+        return min(self.deadline(key) for key in self.stamps)
+
+    def deadline(self, key):
+        return self.stamps[key] + self.lifetime[key] - CLOCK_OFFSET_NS
+
+    def failures(self, wall):
+        return [key for key in self.stamps if wall >= self.deadline(key)]
+
+    def describe(self, key, wall):
+        stamp = self.observed.get(key)
+        age = f'{(wall - stamp)/1e6:.1f}' if stamp else 'missing'
+        return (f'{key} valid={bool(self.stamps[key])} age_ms={age} limit_ms={(self.lifetime[key]-CLOCK_OFFSET_NS)/1e6:.0f} '
+                f'update_interval_ms={self.interval_ms.get(key, float("nan")):.1f}')
+
+    def subscribe(self, node, register=None):
+        from nav_msgs.msg import Odometry
+        from sensor_msgs.msg import LaserScan
+        from tf2_msgs.msg import TFMessage
+        from rclpy.qos import qos_profile_sensor_data
+        subscribe = register or node.create_subscription
+        for msg, topic, callback in ((LaserScan, '/scan', self.scan), (Odometry, '/odom', self.odom),
+                                     (TFMessage, '/tf', self.tf)):
+            subscribe(msg, topic, callback, qos_profile_sensor_data)
 
 
 def clock_responder(link, channel, instance, clock):
@@ -89,12 +114,8 @@ def run(session, pi, library, tolerance):
     from action_msgs.msg import GoalStatus, GoalStatusArray
     from rclpy.qos import qos_profile_action_status_default
     from geometry_msgs.msg import Twist
-    from nav_msgs.msg import Odometry
-    from sensor_msgs.msg import LaserScan
-    from tf2_msgs.msg import TFMessage
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.executors import ExternalShutdownException
-    from rclpy.qos import qos_profile_sensor_data
     from rclpy.utilities import get_rmw_implementation_identifier
 
     if get_rmw_implementation_identifier() != 'rmw_fastrtps_cpp':
@@ -113,9 +134,7 @@ def run(session, pi, library, tolerance):
     sub = reader.create_subscription(Twist, topic, lambda _: None, command_qos())
     values, stamps, writer = (ct.c_double * 6)(), (ct.c_int64 * 2)(), (ct.c_uint8 * 24)()
     health = FeedbackWindow(tolerance)
-    node.create_subscription(LaserScan, '/scan', health.scan, qos_profile_sensor_data)
-    node.create_subscription(Odometry, '/odom', health.odom, qos_profile_sensor_data)
-    node.create_subscription(TFMessage, '/tf', health.tf, qos_profile_sensor_data)
+    health.subscribe(node)
     instance = secrets.token_hex(16)
     goal_at = 0
     def goals(msg):
@@ -201,7 +220,7 @@ def run(session, pi, library, tolerance):
                     continue
                 until = health.valid_until()
                 if any(values) and wall >= until:
-                    raise AuthorityError('stale scan, odometry or localization')
+                    raise AuthorityError('stale feedback: ' + ', '.join(health.describe(k, wall) for k in health.failures(wall)))
                 link.send(['cmd', nonce, instance, owner, t2, clock.check(),
                            stamp.source, stamp.received, list(values), until, goal_at])
             except (AuthorityError, ValueError) as exc:

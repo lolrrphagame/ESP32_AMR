@@ -10,7 +10,27 @@ The laptop source reads each live `/amr/nav2_cmd_vel` Twist with its original DD
 
 A second process for authority status would put a queue between the UART observation, clock challenge and DDS write. That would require transporting and checking the observation time separately to prevent a late queued state from looking current. Keeping the writer on localhost removes network subscribers from this call while retaining the original authority semantics. A stalled private DDS write can still delay the executor. The physical stationary trial should measure that call and the timer interval under load.
 
-The laptop also checks scan, wheel odometry and AMCL map-to-odom measurement times. It subtracts AMCL's configured future dating from the TF stamp. The earliest feedback expiry accompanies each nonzero command and bounds how long the Bridge may drive. Wheel odometry now carries the actual encoder measurement stamp. The feedback window uses the deployed RPP transform tolerance of 0.3 s and accounts for clock uncertainty. The controller's collision check, 5 RPM wheel minimum, speed limits, explicit activation, verified STOP and 300 ms firmware heartbeat retain their existing settings.
+The laptop also checks scan, wheel odometry and AMCL map-to-odom measurement times. It subtracts AMCL's configured future dating from the TF stamp. The earliest feedback expiry accompanies each nonzero command and bounds how long the Bridge may drive. Wheel odometry now carries the actual encoder measurement stamp. The source checks each original measurement against its sensor-specific lifetime and deducts clock uncertainty. The controller's collision check, 5 RPM wheel minimum, speed limits, explicit activation, verified STOP and 300 ms firmware heartbeat retain their existing settings.
+
+## Phase 6E.3 feedback preflight
+
+For the existing 6D.12 installation, run the updated laptop checkout. No Pi files need copying. Start each terminal below in the specified environment. On Pi terminal 1 the omitted scan-mode override selects the driver's default. Verify the startup line actually says **Sensitivity**. Keep motor power isolated. Start Pi terminals 1 and 2 and laptop terminals 1–5. Initialize AMCL in RViz. In laptop terminal 6 run the preflight before starting either the source or Pi adapter. No goal, session ID, UDP link or motion publisher is used by the preflight. Retain the JSONL file from the stationary test before repeating the check in the motion session.
+
+The previous 280 ms laptop limit was exceeded by the measured scan and corrected map-to-odom ages (maxima 398.3 and 400.1 ms). Odom peaked at 103.2 ms. The candidate scan and AMCL lifetime rounds the measured 256 ms driver timing plus a 263 ms inter-publication gap to 520 ms. Both consume the original measurement age; AMCL subtracts its configured future dating. The laptop deducts 20 ms clock uncertainty, giving 500 ms for scan/localization and the existing 280 ms for odometry. The Pi still enforces the forwarded absolute expiry on every movement. Preflight reports the same source verdict and separately warns when remaining margin is 40 ms or less, which can be consumed by the Pi-side subtraction and clock lead before transport. It exits with status 2 on that downstream hold and status 1 on a failed measurement window. All processing and transport time consumes these budgets. The 389 ms Sensitivity delivery gap can still cause a failure depending on the age of the preceding sample.
+
+On the physical run, inspect the JSONL timestamps per sensor. For scan, subtract header time from DDS write time for header-to-publication age; compare consecutive DDS writes for publication interval. DDS receive minus write includes cross-host clock offset. Callback minus receive uses one host clock. The two scan timing fields are recorded for comparison. The upstream ROS 2 driver takes the header timestamp before its blocking SDK read, measures time spent in that read and divides that duration by the number of ray intervals. The installed Pi source revision was inaccessible over SSH. Neither field advances freshness or establishes independently measured beam acquisition time. The reported 10 Hz setting, delivered 7.302 Hz average and 18 ms minimum arrival interval each describe different observations. [Upstream driver](https://github.com/Slamtec/rplidar_ros/blob/ros2/src/rplidar_node.cpp)
+
+To check the installed driver before the test, run the following in Pi terminal 1 after sourcing its public environment. Record the package version and, if built in an overlay, compare its source with the recorded fields. A binary-only installation may have no driver source in the workspace.
+
+```bash
+ros2 pkg prefix rplidar_ros
+ros2 pkg xml rplidar_ros | grep '<version>'
+if [ -d "$HOME/dev_ws/src" ]; then
+    grep -rEn --include='*.cpp' 'grabScanDataHq|scan_duration =|header.stamp = start|time_increment = scan_time' "$HOME/dev_ws/src"
+fi
+```
+
+For the first short, static clear-floor trial, verify clearance from the **swept footprint** along the entire path. At the Bridge caps of 0.06 m/s and 0.35 rad/s and the configured 0.28 m footprint radius, a conservative bound on footprint-edge speed is 0.158 m/s. A 520 ms observation lifetime plus the independent 300 ms firmware watchdog allows about **0.130 m** of edge travel before motor cutoff. Allow additional clearance for actual post-cutoff stopping travel and pose/obstacle uncertainty. The configured 0.4 m inflation radius is a cost setting and supplies no measured physical stopping margin. If those margins are unknown, or any source fails preflight, keep motor power isolated. Passing preflight measures stationary freshness only.
 
 ## Phase 6D.12 upgrade from a running 6D.10 installation
 
@@ -80,7 +100,7 @@ export RMW_FASTRTPS_USE_QOS_FROM_XML=0
 chronyc tracking
 ros2 run rplidar_ros rplidar_composition --ros-args \
     -p serial_port:=/dev/ttyUSB0 -p serial_baudrate:=115200 \
-    -p frame_id:=laser_frame -p scan_mode:=Standard -p angle_compensate:=true
+    -p frame_id:=laser_frame -p angle_compensate:=true
 ```
 
 **Pi terminal 2 — Bridge.** Type `CLEAR_AREA_CUTOFF_READY` when prompted. Copy the new session ID for laptop terminal 6 and Pi terminal 3.
@@ -133,9 +153,13 @@ ros2 topic info -v /amr/nav2_cmd_vel
 ros2 topic info -v /joint_states
 ros2 lifecycle get /bt_navigator
 TOL=$(ros2 param get /amcl transform_tolerance | awk '/Double value is:/ {print $NF}')
-read -rp 'Bridge session ID: ' SESSION
-python3 -Bu tools/amr_nav2_source.py --pi 192.168.50.11 --session "$SESSION" \
-    --amcl-tolerance "$TOL" 2>&1 | tee -a ~/nav2_source_6d10.log
+set -o pipefail
+if python3 -Bu tools/amr_feedback_preflight.py --seconds 120 --amcl-tolerance "$TOL" \
+    > "$HOME/nav2_feedback_$(date +%Y%m%d_%H%M%S).jsonl"; then
+    read -rp 'Bridge session ID: ' SESSION
+    python3 -Bu tools/amr_nav2_source.py --pi 192.168.50.11 --session "$SESSION" \
+        --amcl-tolerance "$TOL" 2>&1 | tee -a ~/nav2_source_6d10.log
+fi
 ```
 
 **Pi terminal 3 — Stationary adapter.** Paste the same session ID and type the requested `ACTIVATE <session-id>`. Stationary mode suppresses all velocity forwarding.
@@ -241,7 +265,7 @@ With motor power isolated, inspect Pi terminal 4 for the fault reason and STOP f
 
 ## Software verification
 
-From the laptop checkout, run the following groups sequentially. The three ROS trials use dedicated domains 191/192, the existing laptop Nav2 overlay, loopback UDP, simulated UART and synthetic LiDAR. Close other instances of the source and Pi adapter on the test host to free the UDP ports.
+From the laptop checkout, run the following groups sequentially. The ROS trials use dedicated domains 191/192, the existing laptop Nav2 overlay, loopback UDP, simulated UART and synthetic LiDAR. Close other instances of the source and Pi adapter on the test host to free the UDP ports.
 
 ```bash
 cd ~/amr_phase_v3_work/ESP32_AMR
@@ -254,14 +278,17 @@ done
 bash tests/pi_nav2/run.sh idle
 bash tests/pi_nav2/run.sh goal
 bash tests/pi_nav2/run.sh loss
+bash tests/pi_nav2/run.sh scan-loss
 ```
 
-All **120 Python tests** and **both native C suites** passed. The local full-stack trials used the installed Humble controller, planner, navigator and AMCL with the V3.3 mock UART.
+All **121 Python tests** and **both native C suites** passed. The local full-stack trials used the installed Humble controller, planner, navigator and AMCL with the V3.3 mock UART.
 
 | Trial | Observed result |
 |---|---|
-| ROS source suspended for 1.35 s, plus injected joint writes of 450 ms and 1,200 ms | Remote proof remained valid during suspension. The following stationary interval lasted 120.005 s. Across the run, the adapter accepted 2,440 independent clock replies. Mock UART received zero arm or velocity frames. |
+| ROS source suspended for 1.35 s, plus injected joint writes of 450 ms and 1,200 ms | Remote proof remained valid during suspension. The following stationary interval lasted 120.000 s. Across the run, the adapter accepted 2,443 independent clock replies. Mock UART received zero arm or velocity frames. |
 | 0.28 m NavigateToPose | Action returned SUCCEEDED. Mock firmware executed the goal. Bridge returned to READY with verified STOP, disarmed firmware and zero PWM. |
 | Remote source suspended during motion | Bridge latched the command deadman and verified STOP. Source resumed, and the trial observed one more second disarmed. Mock UART recorded one arm for the entire session. |
+
+The goal fixture delivers about 6.4 scans/s with reported scan durations of 129 and 256 ms and a gap of 263 ms. A simulated preflight measured maximum scan and corrected localization ages of 389.89 ms and odometry age of 66.39 ms. The action succeeded. In a separate diagnostic run, publishing scan and odometry while withholding AMCL produced a nonzero exit identifying localization as missing. A separate scan-loss trial verified a latched STOP with zero PWM. An earlier source-loss trial hit the command deadman during startup before loss injection; a subsequent run reached motion and verified STOP on source suspension.
 
 These runs used loopback between two ROS domains on the laptop. The two-host latency, physical stationary run, hardware loss/STOP and short floor goal require verification on the robot. Noninteractive SSH reached the Pi and was denied authentication.

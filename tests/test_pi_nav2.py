@@ -202,7 +202,7 @@ class FeedbackWindowTest(unittest.TestCase):
                 window = FeedbackWindow(.5)
                 for key in window.stamps:
                     offset = 500_000_000 if key == 'localization' else 0
-                    stamp = wall - (310_000_000 if key == oldest else 0)
+                    stamp = wall - (window.lifetime[key] if key == oldest else 0)
                     window.record(key, header(stamp + offset), offset)
                 self.assertLess(window.valid_until(), wall)
                 offset = 500_000_000 if oldest == 'localization' else 0
@@ -210,3 +210,29 @@ class FeedbackWindowTest(unittest.TestCase):
                 self.assertGreater(window.valid_until(), wall)
                 window.record(oldest, header(wall + offset + 50_000_000), offset)
                 self.assertLess(window.valid_until(), wall)
+
+    def test_real_scan_and_amcl_age_and_frozen_delayed_feedback(self):
+        from tools.amr_nav2_source import FeedbackWindow
+        health = FeedbackWindow(.5)
+        wall = 100 * NS
+        def record(key, ns):
+            offset = health.amcl_offset if key == 'localization' else 0
+            sec, nanosec = divmod(ns + offset, NS)
+            health.record(key, SimpleNamespace(stamp=SimpleNamespace(sec=sec, nanosec=nanosec)), offset)
+        with patch('time.time_ns', return_value=wall):
+            for key in ('scan', 'localization'):
+                record(key, wall - 398_300_000)
+            record('odom', wall - 103_200_000)
+            self.assertEqual(health.failures(wall), [])
+            until = health.valid_until()
+            # Repeated deliveries of a frozen scan/TF cannot move the deadline.
+            for key in ('scan', 'localization'):
+                record(key, wall - 398_300_000)
+            self.assertEqual(until, health.valid_until())
+            self.assertEqual(set(health.failures(until)), {'scan', 'localization'})
+            record('scan', wall)
+            self.assertEqual(health.failures(until), ['localization'])
+            record('odom', wall - 281_000_000)
+            self.assertIn('odom', health.failures(wall))
+            record('scan', wall + 1)
+            self.assertIn('scan', health.failures(wall))

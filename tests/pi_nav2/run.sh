@@ -2,7 +2,7 @@
 # Real Humble/Nav2, synthetic room and UART. Requires the existing my_amr overlay.
 set -eo pipefail
 mode=${1:-goal}
-case "$mode" in idle|loss|goal) ;; *) exit 2 ;; esac
+case "$mode" in idle|loss|scan-loss|goal) ;; *) exit 2 ;; esac
 cd "$(dirname "$0")/../.."
 fixture=$PWD/tests/pi_nav2
 dir=$(mktemp -d)
