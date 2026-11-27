@@ -30,6 +30,10 @@ class AuthorityError(RuntimeError):
     pass
 
 
+class DDSAgeError(AuthorityError):
+    """DDS timestamps passed validity checks but exceeded the freshness limit."""
+
+
 class WallClockGuard:
     def __init__(self, now=time.monotonic, wall_ns=time.time_ns):
         self.now, self.wall_ns = now, wall_ns
@@ -57,10 +61,15 @@ class DDSStamp:
                 or source <= 0 or received <= 0):
             raise AuthorityError('DDS source or receipt timestamp unavailable')
         skew = CLOCK_OFFSET_NS if remote else 0
-        if not 0 <= wall - received < DEADMAN_NS:
+        receipt_age = wall - received
+        if receipt_age < 0:
             raise AuthorityError('stale or invalid DDS receipt timestamp')
-        if not -skew <= received - source < DEADMAN_NS or wall - source + skew >= DEADMAN_NS:
+        if received - source < -skew:
             raise AuthorityError('stale DDS source timestamp or clock mismatch')
+        if receipt_age >= DEADMAN_NS:
+            raise DDSAgeError('stale or invalid DDS receipt timestamp')
+        if wall - source + skew >= DEADMAN_NS:
+            raise DDSAgeError('stale DDS source timestamp or clock mismatch')
         return cls(source, received)
 
 

@@ -12,8 +12,9 @@ if __package__ in (None, ''):
 
 from amr_ground_protocol import (
     CLOCK_OFFSET_NS, CLOCK_PROOF_S, CONTROL_TOPIC, DEADMAN_NS, DISCOVERY_S, GROUND_TOPIC, NS, SOURCE_TOPICS,
-    STATUS_TOPIC, AuthorityError, CommandStamp, DDSStamp, WallClockGuard, check_dds_publisher, command_qos,
-    arrival_monotonic, inspect_publishers, metadata_executor, status_qos, token_valid,
+    STATUS_TOPIC, AuthorityError, CommandStamp, DDSAgeError, DDSStamp, WallClockGuard,
+    arrival_monotonic, check_dds_publisher, command_qos, inspect_publishers, metadata_executor,
+    status_qos, token_valid,
 )
 from amr_link_metrics import LinkMetrics, PeriodicLinkReport, summarize
 from amr_ros2_bridge_v3 import DEADMAN_S, wheel_targets
@@ -40,6 +41,8 @@ class CommandAdapter:
         self.last_status_at = self.last_probe_at = None
         self.last_source = None
         self.last_motion_source = None
+        self.verified_idle = False
+        self.idle_status_paused = False
         self.bridge_allows_commands = False
         self.fault_reason = None
 
@@ -113,18 +116,34 @@ class CommandAdapter:
             self.fault('bridge is owned by a different adapter activation')
             return
         owned = expected == self.activation and message.get('authority_state') == 'OWNED'
+        link_verified = (owned and message.get('clock_status') == 'VERIFIED'
+                         and (version == '3.2' or message.get('uart_link_ready') is True))
+        verified_idle = (link_verified
+                         and message.get('state') == 'READY' and message.get('stationary_ready') is True
+                         and message.get('firmware_armed') is False and message.get('firmware_running') is False
+                         and message.get('firmware_fault') is False)
         try:
             wall = self.clock.check()
             check_dds_publisher(info, publishers[0])
             if not isinstance(info, dict):
                 raise AuthorityError('DDS status timestamps unavailable')
             t2, sent = info.get('received_timestamp'), info.get('source_timestamp')
-            if (type(t2) is not int or type(sent) is not int or sent <= 0 or t2 <= 0
-                    or not 0 <= wall - t2 < DEADMAN_NS):
-                raise AuthorityError('invalid or stale DDS status metadata')
             if owned or message.get('state') == 'FAULT_LATCHED':
                 DDSStamp.read(info, wall, remote=True)
+            elif (type(t2) is not int or type(sent) is not int or sent <= 0 or t2 <= 0
+                  or not 0 <= wall - t2 < DEADMAN_NS):
+                raise AuthorityError('invalid or stale DDS status metadata')
         except AuthorityError as exc:
+            if (isinstance(exc, DDSAgeError) and self.source == 'nav2' and self.verified_idle
+                    and verified_idle and self.last_motion_source is None):
+                # Keep the last valid receipt and probe. The original watchdogs
+                # still run while waiting for a fresh stationary status.
+                self.idle_status_paused = True
+                self.bridge_allows_commands = False
+                self.status_result('discarded', 'stale_idle_telemetry')
+                if self.status_overdue():
+                    self.fault('bridge status stream lost', self.now() - self.last_status_at)
+                return
             self.status_result('rejected', str(exc))
             self.fault(str(exc))
             return
@@ -142,6 +161,10 @@ class CommandAdapter:
                 self.raw_cutoff = wall
                 if self.metrics:
                     self.metrics.sample('idle_status_gap_ms', gap * 1000)
+        if self.idle_status_paused and verified_idle:
+            self.raw_cutoff = wall
+            self.idle_status_paused = False
+        self.verified_idle = verified_idle
         self.bridge_gid = publishers[0]
         self.last_status_at = received_at
         self.status_result('accepted')
@@ -159,8 +182,7 @@ class CommandAdapter:
             # Only verified stationary feedback that covers the last forwarded
             # movement can restore the idle deadline.
             self.last_motion_source = None
-        self.bridge_allows_commands = (owned and message.get('clock_status') == 'VERIFIED'
-                                       and (version == '3.2' or message.get('uart_link_ready') is True)
+        self.bridge_allows_commands = (link_verified and not self.idle_status_paused
                                        and message.get('state') in ('READY', 'STARTING', 'RUNNING'))
         t1 = message.get('clock_probe_ns')
         if type(t1) is not int or t1 <= 0 or not 0 <= sent - t1 < CLOCK_OFFSET_NS:
@@ -187,7 +209,7 @@ class CommandAdapter:
         if self.status_overdue():
             self.fault('bridge status stream lost', self.now() - self.last_status_at)
             return
-        if (self.source == 'nav2' and self.last_status_at is not None
+        if self.idle_status_paused or (self.source == 'nav2' and self.last_status_at is not None
                 and self.now() - self.last_status_at >= DEADMAN_S):
             return  # Pause admission while idle status is late.
         try:

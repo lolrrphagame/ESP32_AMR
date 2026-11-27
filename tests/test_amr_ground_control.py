@@ -307,6 +307,30 @@ class GroundTest(unittest.TestCase):
         self.assertEqual(self.bridge.state, State.FAULT_LATCHED)
         self.assertIn('clock proof', self.bridge.fault_reason)
 
+    def test_discarded_nav2_status_cannot_extend_bridge_clock_proof(self):
+        self.setup(source='nav2')
+        self.authorize()
+        controls = []
+        adapter = CommandAdapter(self.bridge.session, 'nav2', self.fail, controls.append,
+                                 now=self.clock.now, wall_ns=self.clock.wall, activation=ACTIVATION)
+        self.tick(dt=.76)
+        wall = self.clock.wall()
+        adapter.status(self.bridge.status(), dds(wall, gid=STATUS_GID), (STATUS_GID,))
+        self.assertTrue(adapter.verified_idle)
+
+        self.clock.seconds += .23
+        wall = self.clock.wall()
+        sent = wall - 211_000_000
+        status = dict(self.bridge.status(), clock_probe_ns=sent - 1_000_000)
+        adapter.status(status, dds(sent, wall, STATUS_GID), (STATUS_GID,))
+        self.assertFalse(controls)
+        self.assertIsNone(adapter.fault_reason)
+        self.bridge.tick()
+        self.assertEqual(self.bridge.state, State.FAULT_LATCHED)
+        self.assertIn('clock proof', self.bridge.fault_reason)
+        self.assertTrue(self.bridge.stop_verified)
+        self.assertFalse(self.serial.armed)
+
     def test_firmware_reset_and_counter_jump_block_odometry_continuity(self):
         for change in ('boot', 'count'):
             self.setup()

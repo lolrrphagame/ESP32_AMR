@@ -984,3 +984,83 @@ goal, stop the adapter and bridge, and capture the fault reason. A
 host-only fault with healthy firmware can recover by starting those two
 processes and confirming a new session. A firmware fault or unverified STOP
 requires diagnosis with motor power isolated before another activation.
+
+## Phase 6D.5 Nav2 idle DDS timestamp fault
+
+The physical stationary check reached `READY`, `OWNED` and `VERIFIED`.
+At the fault the robot was disarmed, with verified STOP, valid encoder
+continuity and no firmware or UART fault.
+
+| Event from the adapter retry log | Timestamp (ns) |
+| --- | ---: |
+| Last accepted status DDS receipt | 1795807564917181398 |
+| Rejected sample DDS source on the Pi | 1795807565037479194 |
+| Rejected sample DDS receipt on the laptop | 1795807565248252211 |
+| Laptop adapter callback entry | 1795807565248375691 |
+
+The source-to-receipt difference across the host clocks was **210.773 ms**.
+Receipt to adapter callback took **0.123 ms**. The source age at callback
+entry was **210.896 ms**, or **230.896 ms** with the 20 ms skew margin.
+That crossed the 230 ms source freshness limit. The **331.071 ms** gap
+between receipts was within the existing one-second idle status deadline.
+The bridge's last reported clock offset bounds were **−3.229 to +2.105 ms**,
+and the last valid proof was **440.289 ms** old when the bridge latched.
+
+At the first post-fault report the adapter's maximum callback queue delay
+was 0.708 ms and its maximum timer interval was 41.379 ms. The bridge's
+maximum timer interval was 260.780 ms. Its maximum Q, status publication
+and joint publication times were 36.720 ms, 14.841 ms and 226.008 ms,
+respectively. These cumulative maxima show bridge-side stalls occurred.
+The rejected sample was already late when DDS delivered it to the laptop.
+The available reports leave the exact upstream source of that sample's
+delay unresolved.
+[Adapter diagnostic log](/tmp/amr_6d5/nav2_adapter_6d3_stationary.log:15)
+[Bridge diagnostic log](/tmp/amr_6d5/nav2_bridge_6d3.log:39)
+
+After verified disarmed idle, the adapter discards an age-only failure
+from the pinned bridge and pauses command admission. Only a fresh verified
+idle status can restore admission, and only newly published commands can pass after
+that recovery. Discarded samples contribute no receipt, probe or ownership
+update. The diagnostic counter is `status_reason:stale_idle_telemetry`.
+Invalid clock metadata, publisher conflicts, loss of fresh communication
+and stale telemetry during possible motion still fault. The bridge's clock
+proof expiry, 230 ms motion deadline and firmware's 300 ms heartbeat still
+apply independently.
+
+### Deploy and rerun
+
+Only `amr_ground_protocol.py` and `tools/amr_cmd_vel_adapter.py` need
+deployment, both on the laptop. When running from the updated checkout,
+the commands below load both files directly. For a separate laptop
+deployment directory, run these two commands from the updated checkout
+with `ADAPTER_DEPLOY_DIR` set to that directory.
+
+```bash
+install -D -m 0644 amr_ground_protocol.py "$ADAPTER_DEPLOY_DIR/amr_ground_protocol.py"
+install -D -m 0644 tools/amr_cmd_vel_adapter.py "$ADAPTER_DEPLOY_DIR/tools/amr_cmd_vel_adapter.py"
+```
+
+Use the Pi bridge command in Phase 6D.3 to start a new session after the
+latched fault. With motor power isolated, use the new session ID and type
+`ACTIVATE <session-id>` at the adapter prompt.
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0
+read -r SESSION
+python3 -B tools/amr_cmd_vel_adapter.py --session "$SESSION" --source nav2 \
+    --stationary-check --link-diagnostics 2>&1 | tee ~/nav2_adapter_6d5_stationary.log
+```
+
+Verify a continuous 120-second stationary run before following the
+Phase 6D.3 short-goal procedure. Automated verification passed all 107
+Python tests and both native C suites. The new tests replay the
+measured delay, exercise fresh-status recovery, and verify that stale
+active telemetry, invalid clocks, expired proof and persistent loss
+still fault. A local ROS stack with mock UART and synthetic LiDAR stayed
+owned and disarmed for 120 seconds across an injected bridge pause.
+The adapter discarded one additionally delayed status and recovered.
+The mock UART received zero arm or velocity frames. A separate mock-UART
+DDS test verified STOP after command loss and no rearm on new samples.
+The robot stationary rerun and floor goal remain pending.

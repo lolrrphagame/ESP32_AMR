@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from amr_ground_protocol import DEADMAN_NS, metadata_executor, status_qos
+from amr_ground_protocol import CLOCK_PROOF_S, DEADMAN_NS, metadata_executor, status_qos
 from amr_link_metrics import LinkMetrics, summarize
 from amr_ros2_bridge_v3 import DEADMAN_S, State
 import test_amr_ground_control as ground
@@ -84,7 +84,7 @@ class StatusTest(unittest.TestCase):
         self.status()
         self.clock.seconds += .30
         self.status(delay=.24)
-        self.assertIn('stale DDS status metadata', self.adapter.fault_reason)
+        self.assertIn('stale or invalid DDS receipt timestamp', self.adapter.fault_reason)
         self.assertEqual(self.metrics.counts['status_rejected'], 1)
 
     def test_invalid_session_and_missing_discovery_do_not_renew(self):
@@ -111,6 +111,126 @@ class StatusTest(unittest.TestCase):
                         clock_status='VERIFIED', adapter_activation=ACTIVATION)
         self.adapter.status(incoming, ground.dds(sent, self.clock.wall()), PUBLISHER)
         self.assertIn('stale DDS source timestamp', self.adapter.fault_reason)
+
+
+class Nav2StatusTest(unittest.TestCase):
+    def setUp(self):
+        self.clock = ground.Clock()
+        self.metrics = LinkMetrics('adapter')
+        self.controls, self.commands = [], []
+        self.adapter = CommandAdapter(
+            SESSION, 'nav2', lambda *args: self.commands.append(args), self.controls.append,
+            now=self.clock.now, wall_ns=self.clock.wall, activation=ACTIVATION, metrics=self.metrics)
+        self.adapter.observe((ground.RAW_GID,), PUBLISHER)
+        self.clock.seconds += .26
+        self.adapter.observe((ground.RAW_GID,), PUBLISHER)
+
+    def status(self, transit=.002, queued=0., gid=PUBLISHER[0], **fields):
+        received = self.clock.wall() - round(queued * 1e9)
+        sent = received - round(transit * 1e9)
+        message = dict(session_id=SESSION, command_source='nav2', version='3.3',
+                       bridge_mode='ground', adapter_activation=ACTIVATION, authority_state='OWNED',
+                       clock_status='VERIFIED', clock_probe_ns=sent - 1_000_000,
+                       state='READY', stationary_ready=True, firmware_armed=False,
+                       firmware_running=False, firmware_fault=False, uart_link_ready=True) | fields
+        self.adapter.status(message, ground.dds(sent, received, gid), PUBLISHER)
+
+    def sample(self, stamp=None):
+        wall = self.clock.wall()
+        self.adapter.sample(ground.twist(), ground.dds(wall if stamp is None else stamp,
+                                                      wall, ground.RAW_GID))
+
+    def test_delayed_idle_telemetry_waits_for_fresh_status_and_new_command(self):
+        for elapsed, transit, queued in (
+                (.331194293, .210773017, .000123480),  # The measured robot event.
+                (.221, .215, .001),  # Even before the receipt-gap watchdog pauses motion.
+                (.245, .002, .240)):  # DDS received it in time, executor took it late.
+            with self.subTest(transit=transit, callback_queue=queued):
+                self.setUp()
+                self.status()
+                accepted_state = (self.adapter.last_status_at, self.adapter.last_probe_at,
+                                  self.adapter.bridge_gid, self.adapter.raw_cutoff)
+                self.clock.seconds += elapsed
+                self.status(transit, queued)
+                self.assertIsNone(self.adapter.fault_reason)
+                self.assertFalse(self.adapter.bridge_allows_commands)
+                self.assertEqual(self.metrics.counts['status_discarded'], 1)
+                self.assertEqual(self.metrics.counts['status_accepted'], 1)
+                self.assertEqual([message['kind'] for message in self.controls], ['clock'])
+                self.assertEqual((self.adapter.last_status_at, self.adapter.last_probe_at,
+                                  self.adapter.bridge_gid, self.adapter.raw_cutoff), accepted_state)
+                self.sample()
+                self.assertFalse(self.commands)
+                self.assertIsNone(self.adapter.last_source)
+
+                self.clock.seconds += .06
+                self.status(clock_status='CLOCK_UNVERIFIED')
+                self.assertFalse(self.adapter.bridge_allows_commands)
+                paused_stamp = self.clock.wall()
+                self.sample()
+                self.assertFalse(self.commands)
+                self.assertIsNone(self.adapter.last_source)
+
+                self.clock.seconds += .06
+                self.status()
+                self.assertTrue(self.adapter.bridge_allows_commands)
+                self.sample(paused_stamp)
+                self.assertFalse(self.commands)
+                self.clock.seconds += .01
+                self.sample()
+                self.assertEqual(len(self.commands), 1)
+
+    def test_late_telemetry_faults_after_forwarding_movement(self):
+        self.status()
+        self.clock.seconds += .01
+        self.sample()
+        self.assertEqual(len(self.commands), 1)
+        self.clock.seconds += .23
+        self.status(transit=.211, stationary_source_cutoff_ns=self.clock.wall())
+        self.assertIn('stale DDS source timestamp', self.adapter.fault_reason)
+        self.assertEqual(self.metrics.counts['status_discarded'], 0)
+
+    def test_communication_loss_faults_despite_late_telemetry(self):
+        for repeated_late_status in (False, True):
+            with self.subTest(repeated_late_status=repeated_late_status):
+                self.setUp()
+                self.status()
+                started = self.clock.now()
+                while self.clock.now() - started < CLOCK_PROOF_S:
+                    self.clock.seconds += .25
+                    if repeated_late_status:
+                        self.status(transit=.211)
+                self.adapter.tick()
+                self.assertEqual(self.adapter.fault_reason, 'bridge status stream lost')
+                self.assertEqual(self.metrics.counts['status_accepted'], 1)
+
+    def test_stale_status_cannot_establish_idle_authority(self):
+        self.status(transit=.211)
+        self.assertIn('stale DDS source timestamp', self.adapter.fault_reason)
+        self.assertIsNone(self.adapter.bridge_gid)
+
+    def test_invalid_clock_or_publisher_faults_while_idle(self):
+        for case in ('future_source', 'future_receipt', 'wall_step', 'publisher',
+                     'conflicting_publishers', 'clock_unverified'):
+            with self.subTest(case=case):
+                self.setUp()
+                self.status()
+                self.clock.seconds += .25
+                if case == 'future_source':
+                    self.status(transit=-.021, queued=.240)
+                elif case == 'future_receipt':
+                    self.status(queued=-.001)
+                elif case == 'wall_step':
+                    self.adapter.clock.wall_ns = lambda: self.clock.wall() + 21_000_000
+                    self.status(transit=.211)
+                elif case == 'publisher':
+                    self.status(transit=.211, gid=(9,))
+                elif case == 'conflicting_publishers':
+                    self.adapter.observe_bridge((*PUBLISHER, (9,)))
+                else:
+                    self.status(transit=.211, clock_status='CLOCK_UNVERIFIED')
+                self.assertIsNotNone(self.adapter.fault_reason)
+                self.assertEqual(self.metrics.counts['status_discarded'], 0)
 
 
 class ClockTest(unittest.TestCase):
