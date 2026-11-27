@@ -98,7 +98,8 @@ class CommandAdapter:
             return
         if self.metrics:
             self.metrics.sequence(message.get('status_sequence'))
-        if (message.get('command_source') != self.source or message.get('version') != '3.2'
+        version = message.get('version')
+        if (message.get('command_source') != self.source or version not in ('3.2', '3.3')
                 or message.get('bridge_mode') not in ('raised', 'ground')):
             self.status_result('rejected', 'mode_or_source')
             self.fault('bridge mode or selected source mismatch')
@@ -146,6 +147,7 @@ class CommandAdapter:
             self.fault('bridge latched a fault')
             return
         self.bridge_allows_commands = (owned and message.get('clock_status') == 'VERIFIED'
+                                       and (version == '3.2' or message.get('uart_link_ready') is True)
                                        and message.get('state') in ('READY', 'STARTING', 'RUNNING'))
         t1 = message.get('clock_probe_ns')
         if type(t1) is not int or t1 <= 0 or not 0 <= sent - t1 < CLOCK_OFFSET_NS:

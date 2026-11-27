@@ -60,6 +60,15 @@ class StatusTest(unittest.TestCase):
         self.assertIsNone(self.adapter.fault_reason)
         self.assertAlmostEqual(self.adapter.last_status_at, self.clock.now() - .035)
 
+    def test_v33_adapter_requires_uart_readiness_to_forward_commands(self):
+        self.status(version='3.3', uart_link_ready=False)
+        self.assertIsNone(self.adapter.fault_reason)
+        self.assertFalse(self.adapter.bridge_allows_commands)
+        self.clock.seconds += .06
+        self.status(version='3.3', uart_link_ready=True)
+        self.assertIsNone(self.adapter.fault_reason)
+        self.assertTrue(self.adapter.bridge_allows_commands)
+
     def test_real_arrival_gap_cannot_be_hidden_by_callback_schedule(self):
         self.status()
         self.clock.seconds += .24

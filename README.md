@@ -1,4 +1,10 @@
-# Phase 4L.6A firmware V3.1 and guarded bench protocol
+# ESP32 AMR firmware and ROS 2 bridge
+
+For the current firmware and Bridge V3.3, follow [Phase 4L.7B UART safe
+startup](#phase-4l7b-uart-safe-startup). The V3.1 and V3.2 procedures below
+document the previous release and are also used for rollback.
+
+## Phase 4L.6A firmware V3.1 and guarded bench protocol
 
 ESP32-S3 UART1 uses 57600 baud, 8N1 and 3.3 V logic with a common ground.
 Connect Pi pin 8 (GPIO14 TX) to ESP GPIO18 RX and Pi pin 10 (GPIO15 RX) to
@@ -648,3 +654,183 @@ latched the adapter at an observed 262.75 ms timeout age and propagated
 the fault to the mock bridge. The localhost runs used no UART or motion
 traffic. A cross-host stationary commissioning capture is still needed
 to identify the field trigger.
+
+## Phase 4L.7B UART safe startup
+
+Pair firmware protocol V3.3 with `amr_ros2_bridge_v3_3.py`. UART1 still uses
+GPIO17 TX, GPIO18 RX, 57600 baud, 8N1. The Pi opens `/dev/serial0` exclusively.
+V3.3 defaults to `READ_ONLY`. Ground and raised commissioning use the same
+session, source, clock proof, deadman and physical cutoff requirements as V3.2.
+Use the updated adapter on the DDS host. Its V3.3 path also requires
+`uart_link_ready=true` in the authorized Bridge status.
+
+| Request | V3.3 reply or effect |
+| --- | --- |
+| `VER` | `VERSION PV=3.3 CAP=ARM_CONT,STICKY_FAULT,STATIONARY,BOOT_ID,SAFE_STARTUP`. A build with paired commissioning disabled omits `ARM_CONT`. |
+| `CAPS` | `CAPS PV=3.3 CAP=SAFE_STARTUP,UART_DIAG` with `,ARM_LOW,LOW_FIXED_PAIR,LOW_SESSION_15S` appended when the low-speed bench mode is compiled in. |
+| `Q` | `PV=3.3`, `LS=<state>` and `SU=<startup total>` accompany the existing feedback. `UE` is the operational UART total and `CF` is the control fault total. |
+| `UART_DIAG` | A read-only snapshot with boot identity, link state and both sets of counters. |
+| `STOP` | `OK STOP`. Disables PWM and EN, disarms and preserves fault and error history. |
+| `LINK_BEGIN <client_nonce>` | `LINK_BEGIN <boot> <client_nonce> <challenge>`. Starts an attempt with motors off and a fresh ESP32 challenge. |
+| `LINK_STEP <boot> <challenge> <n>` | `OK LINK_STEP <boot> <challenge> <n>`. Requires STOP within the current attempt and accepts steps 1 through 5 in order. |
+| `LINK_COMMIT <boot> <challenge>` | `OK LINK_COMMIT <boot> <challenge>` after all five steps, 500 ms of clean UART, disarm, zero PWM and stationary encoders. |
+
+Boot IDs are eight lowercase hex digits. Client nonces and ESP32 challenges
+are sixteen lowercase hex digits. CR or LF terminates a request. The Bridge
+verifies the nonce echo and every step response for the current boot and
+challenge. It confirms the post-commit `Q` and `UART_DIAG` snapshots before
+recording its boot and fault-counter baseline or offering DDS control.
+
+At boot the ESP32 is in `WAIT_LINK`. `STOP`, `VER`, `CAPS`, `Q`,
+`UART_DIAG` and the existing `T` echo work there. ARM variants and velocity
+requests require `LINK_READY`. An error during the initial `HANDSHAKE`
+cancels the attempt, records the event and leaves the motors disabled. Each
+ESP32 attempt expires after 2 seconds. The Bridge has a 5-second startup
+budget plus bounded in-flight UART and STOP verification time. If it cannot
+verify startup, it publishes a fault and inhibits control for that process.
+
+The first transition to `LINK_READY` is the boundary between startup and
+operational UART counters for that boot. A healthy reconnect needs a fresh
+handshake with outputs disabled. Errors during that reconnect still count
+as operational. Any operational UART or parser error latches the firmware
+fault and disables both motors. STOP and reconnect preserve the fault. An
+ESP32 reset or boot ID change while the Bridge is running latches the Bridge
+fault and invalidates encoder continuity and control authority. Recovery
+requires a new Bridge process after diagnosing the fault. The legacy
+bridges reject the V3.3 protocol, and V3.3 rejects V3.1 firmware.
+
+### Reading UART diagnostics
+
+A reply has the form
+`UART_DIAG BOOT=<id> LS=<state> READY=<0|1> SU=<startup> UE=<operational> LAST=<event|NONE> US=<us> S=<csv> O=<csv>`.
+`US` is the firmware detection time in microseconds since ESP32 boot.
+`S` and `O` contain startup and operational counts in this order.
+
+```text
+UART_BREAK, UART_BUFFER_FULL, UART_FIFO_OVF, UART_FRAME_ERR, UART_PARITY_ERR,
+UART_RX, FRAME_GAP, BAD_BYTE, FRAME_OVERFLOW, BAD_ARM_LOW, BAD_V, COMMAND,
+LINK_PROTOCOL, UART_QUEUE_FULL
+```
+
+Counts saturate at the unsigned 32-bit maximum and persist across STOP and
+reconnect until ESP32 reset. The firmware counts events delivered by ESP-IDF.
+`UART_QUEUE_FULL` signals that some event detail could have been lost in the
+driver queue. The counters cover the period after the UART driver starts.
+
+`/amr_bridge/status` publishes `uart_startup_state`, `uart_link_ready`,
+`uart_startup_errors`, `uart_operational_errors`, `uart_last_error_event`
+and `uart_last_error_us`. The latest event comes from `UART_DIAG` at startup
+and after the Bridge inhibits control on a fault. `Q` carries totals on the
+normal control path. A temporarily unavailable diagnostic field is `null`.
+For the full per-event counts on the Pi, stop the Bridge to release the port
+and query directly.
+
+```bash
+python3 -B - <<'PY'
+from amr_ros2_bridge_v3_1 import exclusive_uart
+
+with exclusive_uart('/dev/serial0') as uart:
+    print(uart.exchange('UART_DIAG', 'UART_DIAG ', prefix=True, drain=True,
+                        reply_limit=512, timeout=0.15))
+PY
+```
+
+### Offline checks and ESP32-S3 build
+
+The Python tests use a fake UART device and clock for the startup and motion
+scenarios. The native C tests exercise firmware startup policy and the
+existing low-speed policy without peripherals.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+native_test_dir=$(mktemp -d)
+for test in test_low_speed_policy test_uart_startup; do
+    cc -std=c11 -Wall -Wextra -Werror -pedantic -I main "tests/$test.c" -o "$native_test_dir/$test" &&
+        "$native_test_dir/$test" || exit 1
+done
+```
+
+Build with ESP-IDF 6.1 for ESP32-S3 with 16 MB flash.
+
+```bash
+source ~/.espressif/tools/activate_idf_v6.1.sh
+idf.py --version
+idf_build_dir=$(mktemp -d)
+printf 'CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y\n' > "$idf_build_dir/sdkconfig.defaults"
+idf_args=(-B "$idf_build_dir/build" -D "SDKCONFIG=$idf_build_dir/sdkconfig"
+          -D "SDKCONFIG_DEFAULTS=$idf_build_dir/sdkconfig.defaults" -D IDF_TARGET=esp32s3)
+idf.py "${idf_args[@]}" build
+```
+
+### Manual flash and Pi deployment
+
+Physically isolate motor power, verify the cutoff and stop the Bridge and
+command sources before flashing. With the logic supply on, set `ESP_USB_PORT`
+to the ESP32's USB programming device on the build host and flash the image
+manually from the same shell.
+
+```bash
+idf.py "${idf_args[@]}" -p "$ESP_USB_PORT" flash
+```
+
+Set `PI_HOST` to the Pi SSH destination. Copy the committed branch to a
+separate directory on the Pi. Use this same revision of the adapter and
+commissioning tools on the DDS host.
+
+```bash
+git archive phase4l-uart-startup-v3-3 |
+    ssh "$PI_HOST" 'mkdir -p ~/amr_uart_v33 && tar -xf - -C ~/amr_uart_v33'
+```
+
+On the Pi, source ROS 2 Humble and use the same isolated ROS domain on each
+DDS host. Start in read-only mode with motor power isolated. An optional
+`--link-diagnostics` flag emits the existing Link Diagnostics summaries.
+
+```bash
+cd ~/amr_uart_v33
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0
+python3 -B amr_ros2_bridge_v3_3.py --port /dev/serial0 --link-diagnostics
+```
+
+### Cold-boot validation with motor power isolated
+
+1. Leave motor power physically isolated and keep command publishers off.
+   Verify the E-stop and secure the wheels before powering the logic.
+2. Shut down the Pi cleanly, then remove logic power from both devices. Apply
+   logic power to the Pi and ESP32 together. Wait for Pi login without
+   resetting the ESP32. Ensure only the intended process will open
+   `/dev/serial0`, which should resolve to `/dev/ttyAMA0`.
+3. Before starting the Bridge, issue `UART_DIAG` on the Pi and record the
+   boot ID, `WAIT_LINK`, the startup counts and the latest event. Check
+   `READY=0` and `UE=0`.
+4. Run Bridge V3.3 in read-only mode. In another terminal, run
+   `ros2 topic echo --once /amr_bridge/status`. Confirm `LINK_READY`, the
+   same boot ID, `stop_verified=true`, A=0, RUN=0, zero PWM, stationary
+   feedback, valid encoder continuity and zero operational/control faults.
+   Compare startup counts with the pre-handshake snapshot. Any increase should
+   appear in diagnostics. An error during an attempt requires a fresh
+   handshake.
+5. Repeat the simultaneous power cycle several times and record results per
+   boot ID. If the Bridge faults, record its reason and the full `UART_DIAG`
+   response. Keep motor power isolated throughout this procedure.
+
+Offline regression and the firmware build do not establish a cold-boot
+result on the robot.
+
+### Rollback to firmware V3.1 and Bridge V3.2
+
+Keep motor power isolated and stop the V3.3 Bridge and adapter. Use the
+known-good V3.1 image, or build it with ESP-IDF 6.1 from the original HEAD
+in a separate worktree.
+
+```bash
+git worktree add --detach ../ESP32_AMR_v31_rollback 6f07c6b7add5b2deadd084eca6735658b7b8fea8
+cd ../ESP32_AMR_v31_rollback
+```
+
+Repeat the build steps with a fresh temporary build directory, then flash
+that image manually. On the Pi and DDS host, use the previous deployment
+from the same revision. Start `amr_ros2_bridge_v3_2.py --port /dev/serial0`
+in read-only mode and confirm protocol 3.1 and verified stationary STOP
+with motor power still isolated.

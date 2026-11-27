@@ -50,22 +50,23 @@ class Uart:
         self.monotonic = monotonic
         self.buffer = bytearray()
 
-    def exchange(self, command, expected, *, prefix=False, drain=False):
-        deadline = self.monotonic() + UART_TIMEOUT_S
+    def exchange(self, command, expected, *, prefix=False, drain=False,
+                 reply_limit=256, timeout=UART_TIMEOUT_S):
+        deadline = self.monotonic() + timeout
         frame = (command + '\r').encode('ascii')
         if self.port.write(frame) != len(frame):
             raise ProtocolError(f'incomplete UART write for {command!r}')
         while self.monotonic() < deadline:
             end = self.buffer.find(b'\n')
             if end < 0:
-                if len(self.buffer) >= 256:
+                if len(self.buffer) >= reply_limit:
                     self.buffer.clear()
                     raise ProtocolError('oversized UART reply')
                 self.buffer.extend(self.port.read(max(1, min(self.port.in_waiting, 256))))
                 continue
             line = bytes(self.buffer[:end]).removesuffix(b'\r')
             del self.buffer[:end + 1]
-            if not line or len(line) >= 256 or not all(32 <= value <= 126 for value in line):
+            if not line or len(line) >= reply_limit or not all(32 <= value <= 126 for value in line):
                 if drain:
                     continue
                 raise ProtocolError('malformed UART reply')

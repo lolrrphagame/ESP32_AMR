@@ -100,7 +100,7 @@ class BridgeV32(BridgeV31):
 
     def start(self):
         super().start()
-        if self.commissioning and self.state != State.FAULT_LATCHED and self.protocol != '3.1':
+        if self.commissioning and self.state != State.FAULT_LATCHED and self.protocol != self.extended_version:
             self.latch('ground commissioning requires firmware V3.1')
 
     def query(self):
@@ -153,7 +153,7 @@ class BridgeV32(BridgeV31):
 
     def issue_challenge(self):
         if (not self.commissioning or self.state == State.FAULT_LATCHED
-                or self.protocol != '3.1'):
+                or self.protocol != self.extended_version):
             return None
         try:
             t1 = self.clock.check()
@@ -484,7 +484,7 @@ def attach_bridge_link(node, executor, bridge, *, status_topic=STATUS_TOPIC,
     return before_tick, publish
 
 
-def run_ros(port, commissioning, source, duration, limits, diagnostics=False):
+def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *, bridge_class=BridgeV32):
     import rclpy
     from geometry_msgs.msg import TwistStamped
     from rclpy.clock import Clock, ClockType
@@ -502,7 +502,7 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False):
         metrics = LinkMetrics('bridge') if diagnostics else None
         reporter = PeriodicLinkReport(metrics) if metrics else None
         with exclusive_uart(port) as uart:
-            bridge = BridgeV32(uart, commissioning, source, duration, limits, metrics=metrics)
+            bridge = bridge_class(uart, commissioning, source, duration, limits, metrics=metrics)
             before_tick, publish = attach_bridge_link(node, executor, bridge)
             try:
                 bridge.start()
@@ -563,8 +563,10 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False):
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(*, runner=None, description=__doc__):
+    if runner is None:
+        runner = run_ros
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--port', default='/dev/serial0')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--ground-control', action='store_true')
@@ -600,7 +602,7 @@ def main():
         if entered.strip() != token:
             return 1
     try:
-        return run_ros(args.port, commissioning, args.source, args.session_seconds, limits, args.link_diagnostics)
+        return runner(args.port, commissioning, args.source, args.session_seconds, limits, args.link_diagnostics)
     except ImportError as exc:
         print(f'Bridge dependency unavailable: {exc}', file=sys.stderr, flush=True)
         return 1

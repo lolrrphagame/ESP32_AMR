@@ -1,6 +1,6 @@
-// ESP32-S3 AMR - Phase 4L.6A: guarded bench-only PI velocity control.
+// ESP32-S3 AMR - Phase 4L.7B: guarded PI velocity control with UART safe startup.
 // ESP-IDF 6.1. GPIO assignments retained from tested Phase 3.
-// STARTUP: motors are OFF. Explicit ARM, ARM_CONT or ARM_LOW and valid V frames are necessary.
+// Motion requires LINK_READY, explicit arming and valid V frames.
 // STOP, framing faults, heartbeat loss and applicable arm expiry disable motors.
 // WARNING: Software stops are NOT a substitute for a physical E-stop, fuse, and EN pull-downs.
 // Confirm IBT-2 74HC244 + driver supply levels and raise wheels BEFORE testing.
@@ -9,6 +9,7 @@
 #define ALLOW_DUAL_WHEEL_TEST 1  // Keep at 0 in the initial bench tests.
 
 #include <errno.h>
+#include <inttypes.h>
 #include <float.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -23,6 +24,7 @@
 #include "driver/mcpwm_prelude.h"
 #include "driver/pulse_cnt.h"
 #include "driver/uart.h"
+#include "bootloader_random.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -32,11 +34,13 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "low_speed_policy.h"
+#include "uart_startup.h"
 
 #define UART_PORT           UART_NUM_1
 #define UART_TX_GPIO        17
 #define UART_RX_GPIO        18
 #define UART_BAUD           57600
+#define UART_EVENT_QUEUE    64
 #define FRAME_MAX          64
 #define FRAME_GAP_US       200000LL
 #define PCNT_LIMIT         30000
@@ -79,6 +83,7 @@ static mcpwm_timer_handle_t pwm_timer;
 static QueueHandle_t uart_events;
 static SemaphoreHandle_t state_mutex;
 static uint32_t boot_id;
+static uart_startup_t uart_link;  // Protected by state_mutex, together with st.
 
 typedef struct {
     mcpwm_oper_handle_t oper;
@@ -107,7 +112,6 @@ typedef struct {
     float measured[2];            // Filtered signed RPM, normalized forward-positive.
     float duty[2];                // Applied PWM duty magnitude in percent.
     int32_t ticks[2];             // Normalized signed ticks (R has inverted raw sign).
-    uint32_t uart_errors;
     uint32_t control_faults;
     uint32_t motion_epoch;        // Invalidate synchronizer after ANY STOP/re-arm.
     bool sync_enabled;            // Diagnostic fields; not part of UART protocol.
@@ -201,8 +205,8 @@ static void stop_all_locked(void)
 
 static void latch_fault_locked(const char *reason, bool uart_fault)
 {
-    if (uart_fault) st.uart_errors++;
-    else st.control_faults++;
+    if (!uart_fault && st.control_faults != UINT32_MAX) st.control_faults++;
+    uart_startup_latch_fault(&uart_link);
     if (!st.fault_reason) st.fault_reason = reason;
     stop_all_locked();
 }
@@ -491,10 +495,14 @@ static bool seq_test_frame(const char *s, size_t n)
     return true;
 }
 
-static void uart_fault(const char *reason)
+static void uart_fault(amr_uart_event_t event, const char *reason)
 {
     lock_state();
-    latch_fault_locked(reason, true);
+    if (uart_startup_record_error(&uart_link, event, esp_timer_get_time())) {
+        latch_fault_locked(reason, true);
+    } else {
+        stop_all_locked();
+    }
     unlock_state();
 }
 
@@ -503,6 +511,7 @@ static const char *arm_locked(bool continuous, int characterization_rpm, int64_t
 {
     check_deadlines_locked(now);
     if (st.fault_reason) return "ERR FAULT\r\n";
+    if (!uart_startup_motion_allowed(&uart_link)) return "ERR LINK_NOT_READY\r\n";
     if (st.active || (st.armed && (continuous || st.continuous))) return "ERR BUSY\r\n";
     if (continuous && !st.stationary) return "ERR NOT_STATIONARY\r\n";
     st.armed = true;
@@ -520,6 +529,7 @@ static const char *velocity_locked(double left, double right, int64_t now)
 {
     check_deadlines_locked(now);
     if (st.fault_reason) return "ERR FAULT\r\n";
+    if (!uart_startup_motion_allowed(&uart_link)) return "ERR LINK_NOT_READY\r\n";
 
     float target[] = {(float)left, (float)right};
     if (st.characterization_rpm != 0) {
@@ -589,6 +599,119 @@ static bool parse_velocity(const char *line, double *left, double *right)
     return *end == '\0';
 }
 
+static const char *uart_link_name(uart_link_state_t state)
+{
+    switch (state) {
+        case WAIT_LINK: return "WAIT_LINK";
+        case HANDSHAKE: return "HANDSHAKE";
+        case LINK_READY: return "LINK_READY";
+        case FAULT_LATCHED: return "FAULT_LATCHED";
+    }
+    abort();
+}
+
+static void send_uart_diag(void)
+{
+    lock_state();
+    const uart_startup_t link = uart_link;
+    unlock_state();
+    char out[512];
+    size_t used = snprintf(out, sizeof(out),
+                           "UART_DIAG BOOT=%08" PRIx32 " LS=%s READY=%d SU=%" PRIu32
+                           " UE=%" PRIu32 " LAST=%s US=%" PRId64,
+                           boot_id, uart_link_name(link.state), link.state == LINK_READY,
+                           link.startup_total, link.operational_total,
+                           link.last_event ? link.last_event : "NONE", link.last_error_us);
+    for (unsigned group = 0; group < 2; group++) {
+        const uint32_t *counts = group == 0 ? link.startup : link.operational;
+        for (unsigned i = 0; i < AMR_EVENT_COUNT; i++) {
+            const char *separator = i ? "," : group == 0 ? " S=" : " O=";
+            used += snprintf(out + used, sizeof(out) - used, "%s%" PRIu32, separator, counts[i]);
+        }
+    }
+    snprintf(out + used, sizeof(out) - used, "\r\n");
+    send_uart(out);
+}
+
+static bool parse_hex(const char *token, size_t length, uint64_t *value)
+{
+    *value = 0;
+    for (size_t i = 0; i < length; i++) {
+        const char c = token[i];
+        if (c >= '0' && c <= '9') *value = (*value << 4) | (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') *value = (*value << 4) | (unsigned)(c - 'a' + 10);
+        else return false;
+    }
+    return true;
+}
+
+static void link_protocol_error(void)
+{
+    uart_fault(AMR_EVENT_LINK_PROTOCOL, "LINK_PROTOCOL");
+    send_uart("ERR LINK_PROTOCOL\r\n");
+}
+
+static void process_link(const char *line)
+{
+    char out[80];
+    if (!strncmp(line, "LINK_BEGIN ", 11)) {
+        uint64_t client;
+        if (strlen(line + 11) != 16 || !parse_hex(line + 11, 16, &client)) {
+            link_protocol_error();
+            return;
+        }
+        uint64_t challenge;
+        bootloader_random_enable(); // No RF or ADC users in this build.
+        esp_fill_random(&challenge, sizeof(challenge));
+        bootloader_random_disable();
+        lock_state();
+        const bool accepted = uart_startup_begin(&uart_link, challenge, esp_timer_get_time());
+        if (accepted) stop_all_locked();
+        unlock_state();
+        if (!accepted) {
+            send_uart("ERR FAULT\r\n");
+            return;
+        }
+        snprintf(out, sizeof(out), "LINK_BEGIN %08" PRIx32 " %016" PRIx64 " %016" PRIx64 "\r\n",
+                 boot_id, client, challenge);
+        send_uart(out);
+        return;
+    }
+
+    const bool step = !strncmp(line, "LINK_STEP ", 10);
+    const bool commit = !strncmp(line, "LINK_COMMIT ", 12);
+    if (!step && !commit) {
+        link_protocol_error();
+        return;
+    }
+    const char *args = line + (step ? 10 : 12);
+    uint64_t boot, challenge;
+    if (strlen(args) != (step ? 27 : 25) || args[8] != ' ' ||
+        !parse_hex(args, 8, &boot) || !parse_hex(args + 9, 16, &challenge) ||
+        (step && (args[25] != ' ' || args[26] < '1' || args[26] > '0' + UART_PROOF_COUNT))) {
+        link_protocol_error();
+        return;
+    }
+
+    lock_state();
+    const int64_t now = esp_timer_get_time();
+    uart_startup_tick(&uart_link, now);
+    const bool accepted = boot == boot_id && (step
+        ? uart_startup_prove(&uart_link, challenge, (unsigned)(args[26] - '0'))
+        : uart_startup_commit(&uart_link, challenge, now,
+                              !st.armed && !st.active && st.duty[0] == 0 && st.duty[1] == 0 &&
+                              st.stationary));
+    const bool faulted = st.fault_reason != NULL;
+    unlock_state();
+    if (!accepted) {
+        send_uart(faulted ? "ERR FAULT\r\n" : "ERR LINK_PROOF\r\n");
+        return;
+    }
+    // Echo the boot, challenge and step (where applicable) for exact freshness checks.
+    snprintf(out, sizeof(out), "OK %s\r\n", line);
+    send_uart(out);
+}
+
 static void process_line(char *line, size_t n)
 {
     if (seq_test_frame(line, n)) {
@@ -598,38 +721,56 @@ static void process_line(char *line, size_t n)
         return;
     }
     if (!strcmp(line, "STOP")) {
-        lock_state(); stop_all_locked(); unlock_state();
+        lock_state();
+        stop_all_locked();
+        uart_startup_stop(&uart_link);
+        unlock_state();
         send_uart("OK STOP\r\n");
         return;
     }
     if (!strcmp(line, "VER")) {
-        send_uart("VERSION PV=3 CAP=ARM_CONT,STICKY_FAULT,STATIONARY,BOOT_ID\r\n");
+#if ENABLE_CLOSED_LOOP_TEST && ALLOW_DUAL_WHEEL_TEST
+        send_uart("VERSION PV=3.3 CAP=ARM_CONT,STICKY_FAULT,STATIONARY,BOOT_ID,SAFE_STARTUP\r\n");
+#else
+        send_uart("VERSION PV=3.3 CAP=STICKY_FAULT,STATIONARY,BOOT_ID,SAFE_STARTUP\r\n");
+#endif
         return;
     }
     if (!strcmp(line, "CAPS")) {
 #if ENABLE_CLOSED_LOOP_TEST && ALLOW_DUAL_WHEEL_TEST
-        send_uart("CAPS PV=3.1 CAP=ARM_LOW,LOW_FIXED_PAIR,LOW_SESSION_15S\r\n");
+        send_uart("CAPS PV=3.3 CAP=SAFE_STARTUP,UART_DIAG,ARM_LOW,LOW_FIXED_PAIR,LOW_SESSION_15S\r\n");
 #else
-        send_uart("CAPS PV=3.1 CAP=NONE\r\n");
+        send_uart("CAPS PV=3.3 CAP=SAFE_STARTUP,UART_DIAG\r\n");
 #endif
+        return;
+    }
+    if (!strcmp(line, "UART_DIAG")) {
+        send_uart_diag();
+        return;
+    }
+    if (!strncmp(line, "LINK_", 5)) {
+        process_link(line);
         return;
     }
     if (!strcmp(line, "Q")) {
         app_state_t s;
+        uart_startup_t link;
         lock_state();
         check_deadlines_locked(esp_timer_get_time());
         s = st;
+        link = uart_link;
         unlock_state();
         char out[256];
         snprintf(out, sizeof(out),
                  "STATUS A=%d RUN=%d L=%+.1f/%+.1f DL=%.1f TL=%ld R=%+.1f/%+.1f DR=%.1f TR=%ld UE=%lu CF=%lu"
-                 " MODE=%s FL=%d FR=%s ST=%d BOOT=%08lx PV=3.1 SC=%+.2f\r\n",
+                 " MODE=%s FL=%d FR=%s ST=%d BOOT=%08lx PV=3.3 SC=%+.2f LS=%s SU=%lu\r\n",
                  s.armed, s.active, s.target[0], s.measured[0], s.duty[0], (long)s.ticks[0],
                  s.target[1], s.measured[1], s.duty[1], (long)s.ticks[1],
-                 (unsigned long)s.uart_errors, (unsigned long)s.control_faults,
+                 (unsigned long)link.operational_total, (unsigned long)s.control_faults,
                  s.armed ? (s.characterization_rpm ? "LOW" : s.continuous ? "CONT" : "LEGACY") : "IDLE",
                  s.fault_reason != NULL, s.fault_reason ? s.fault_reason : "NONE",
-                 s.stationary, (unsigned long)boot_id, s.sync_correction_rpm);
+                 s.stationary, (unsigned long)boot_id, s.sync_correction_rpm,
+                 uart_link_name(link.state), (unsigned long)link.startup_total);
         send_uart(out);
         return;
     }
@@ -648,7 +789,7 @@ static void process_line(char *line, size_t n)
 #if ENABLE_CLOSED_LOOP_TEST && ALLOW_DUAL_WHEEL_TEST
         int rpm;
         if (!parse_low_speed_arm(line + 8, &rpm)) {
-            uart_fault("BAD_ARM_LOW");
+            uart_fault(AMR_EVENT_BAD_ARM_LOW, "BAD_ARM_LOW");
             send_uart("ERR BAD_ARM_LOW\r\n");
             return;
         }
@@ -664,8 +805,16 @@ static void process_line(char *line, size_t n)
     if (n >= 2 && line[0] == 'V' && line[1] == ' ') {
         double l, r;
         if (!parse_velocity(line, &l, &r)) {
-            uart_fault("BAD_V");
+            uart_fault(AMR_EVENT_BAD_V, "BAD_V");
             send_uart("ERR BAD_V\r\n");
+            return;
+        }
+        lock_state();
+        const bool link_ready = uart_startup_motion_allowed(&uart_link);
+        const bool faulted = st.fault_reason != NULL;
+        unlock_state();
+        if (!link_ready) {
+            send_uart(faulted ? "ERR FAULT\r\n" : "ERR LINK_NOT_READY\r\n");
             return;
         }
         if (fabs(l) > FLT_MAX || fabs(r) > FLT_MAX ||
@@ -684,8 +833,56 @@ static void process_line(char *line, size_t n)
 #endif
         return;
     }
-    uart_fault("COMMAND");
+    uart_fault(AMR_EVENT_COMMAND, "COMMAND");
     send_uart("ERR COMMAND\r\n");
+}
+
+static bool handle_uart_event(uart_event_type_t type)
+{
+    switch (type) {
+        case UART_BREAK: uart_fault(AMR_EVENT_UART_BREAK, "UART_HW"); break;
+        case UART_BUFFER_FULL: uart_fault(AMR_EVENT_UART_BUFFER_FULL, "UART_HW"); break;
+        case UART_FIFO_OVF: uart_fault(AMR_EVENT_UART_FIFO_OVF, "UART_HW"); break;
+        case UART_FRAME_ERR: uart_fault(AMR_EVENT_UART_FRAME_ERR, "UART_HW"); break;
+        case UART_PARITY_ERR: uart_fault(AMR_EVENT_UART_PARITY_ERR, "UART_HW"); break;
+        default: return false;
+    }
+    return true;
+}
+
+static void recover_uart_input(void)
+{
+    if (uart_flush_input(UART_PORT) == ESP_OK) return;
+
+    // If the driver cannot discard damaged input, keep the link inhibited.
+    lock_state();
+    const bool operational = uart_startup_record_error(&uart_link, AMR_EVENT_UART_RX,
+                                                       esp_timer_get_time());
+    latch_fault_locked("UART_RX", operational);
+    unlock_state();
+}
+
+// The UART task runs on the driver ISR's core. Inspect queued events before
+// admitting any complete frame. Never reset the queue and discard error events.
+static bool collect_uart_errors(TickType_t wait)
+{
+    uart_event_t event;
+    if (!xQueueReceive(uart_events, &event, wait)) return false;
+    bool queue_full = false;
+    bool hardware_error = false;
+    for (unsigned i = 0; ; i++) {
+        // One slot became available when the oldest event was removed.
+        if (!queue_full && uxQueueSpacesAvailable(uart_events) <= 1) {
+            uart_fault(AMR_EVENT_UART_QUEUE_FULL, "UART_HW");
+            queue_full = hardware_error = true;
+        }
+        hardware_error |= handle_uart_event(event.type);
+        if (i + 1 == UART_EVENT_QUEUE || !xQueueReceive(uart_events, &event, 0)) break;
+    }
+    if (hardware_error) {
+        recover_uart_input();
+    }
+    return hardware_error;
 }
 
 static void uart_task(void *arg)
@@ -695,66 +892,64 @@ static void uart_task(void *arg)
     size_t used = 0;
     bool overflow = false;
     int64_t last_byte = 0;
-    uart_event_t e;
+    TickType_t wait = 0;
     for (;;) {
-        if (xQueueReceive(uart_events, &e, pdMS_TO_TICKS(10))) {
-            if (e.type == UART_FIFO_OVF || e.type == UART_BUFFER_FULL ||
-                e.type == UART_FRAME_ERR || e.type == UART_PARITY_ERR || e.type == UART_BREAK) {
-                uart_fault("UART_HW");
-                uart_flush_input(UART_PORT);
-                xQueueReset(uart_events);
-                used = 0; overflow = false;
-                ESP_LOGW(TAG, "UART hardware error event=%d; motors stopped", (int)e.type);
-                send_uart("ERR UART_HW\r\n");
-            } else if (e.type == UART_DATA) {
-                size_t unread = e.size;
-                while (unread > 0) {
-                    uint8_t data[64];
-                    size_t want = unread > sizeof(data) ? sizeof(data) : unread;
-                    int got = uart_read_bytes(UART_PORT, data, want, pdMS_TO_TICKS(20));
-                    if (got <= 0) {
-                        uart_fault("UART_RX");
-                        used = 0;
-                        overflow = true;
-                        last_byte = esp_timer_get_time();
-                        break;
-                    }
-                    unread -= (size_t)got;
-                    for (int i = 0; i < got; i++) {
-                        const int64_t now = esp_timer_get_time();
-                        if ((used || overflow) && now - last_byte > FRAME_GAP_US) {
-                            used = 0; overflow = true;
-                            uart_fault("FRAME_GAP");
-                            ESP_LOGW(TAG, "UART partial frame expired, motor disabled");
-                        }
-                        last_byte = now;
-                        uint8_t b = data[i];
-                        if (b == '\r' || b == '\n') {
-                            if (overflow) {
-                                send_uart("ERR FRAME\r\n");
-                            } else if (used > 0) {
-                                frame[used] = 0;
-                                process_line(frame, used);
-                            }
-                            used = 0; overflow = false;
-                        } else if (b < 0x20 || b > 0x7e) {
-                            used = 0; overflow = true;
-                            uart_fault("BAD_BYTE");
-                            send_uart("ERR BAD_BYTE\r\n");
-                        } else if (!overflow && used < FRAME_MAX) {
-                            frame[used++] = (char)b;
-                        } else if (!overflow) {
-                            overflow = true;
-                            uart_fault("FRAME_OVERFLOW");
-                        }
-                    }
+        if (collect_uart_errors(wait)) {
+            used = 0;
+            overflow = false;  // Hardware recovery flushed the RX buffer.
+        }
+        lock_state();
+        uart_startup_tick(&uart_link, esp_timer_get_time());
+        unlock_state();
+        uint8_t data[64];
+        int got = uart_read_bytes(UART_PORT, data, sizeof(data), 0);
+        wait = got > 0 ? 0 : pdMS_TO_TICKS(10);
+        if (got < 0) {
+            uart_fault(AMR_EVENT_UART_RX, "UART_RX");
+            recover_uart_input();
+            used = 0;
+            overflow = false;
+        }
+        for (int i = 0; i < got; i++) {
+            const int64_t now = esp_timer_get_time();
+            if (used && now - last_byte > FRAME_GAP_US) {
+                used = 0;
+                overflow = true;
+                uart_fault(AMR_EVENT_FRAME_GAP, "FRAME_GAP");
+            }
+            last_byte = now;
+            uint8_t b = data[i];
+            if (b == '\r' || b == '\n') {
+                if (collect_uart_errors(0)) {
+                    used = 0;
+                    overflow = false;
+                    break;
                 }
+                if (overflow) {
+                    send_uart("ERR FRAME\r\n");
+                } else if (used > 0) {
+                    frame[used] = 0;
+                    process_line(frame, used);
+                }
+                used = 0;
+                overflow = false;
+            } else if (b < 0x20 || b > 0x7e) {
+                used = 0;
+                overflow = true;
+                uart_fault(AMR_EVENT_BAD_BYTE, "BAD_BYTE");
+                send_uart("ERR BAD_BYTE\r\n");
+            } else if (!overflow && used < FRAME_MAX) {
+                frame[used++] = (char)b;
+            } else if (!overflow) {
+                used = 0;
+                overflow = true;
+                uart_fault(AMR_EVENT_FRAME_OVERFLOW, "FRAME_OVERFLOW");
             }
         }
-        if (used && esp_timer_get_time() - last_byte > FRAME_GAP_US) {
-            used = 0; overflow = false;
-            uart_fault("FRAME_GAP");
-            ESP_LOGW(TAG, "UART frame timeout (no CR/LF), motors stopped");
+        if ((used || overflow) && esp_timer_get_time() - last_byte > FRAME_GAP_US) {
+            if (used) uart_fault(AMR_EVENT_FRAME_GAP, "FRAME_GAP");
+            used = 0;
+            overflow = false;
         }
     }
 }
@@ -766,12 +961,13 @@ static void uart_init(void)
         .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT
     };
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 2048, 512, 20, &uart_events, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 2048, 512, UART_EVENT_QUEUE, &uart_events, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_PORT, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_TX_GPIO, UART_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    if (xTaskCreate(uart_task, "amr_serial", 6144, NULL, 6, NULL) != pdPASS) abort();
+    if (xTaskCreatePinnedToCore(uart_task, "amr_serial", 6144, NULL, 6, NULL,
+                                xPortGetCoreID()) != pdPASS) abort();
 }
 
 void app_main(void)
@@ -782,10 +978,12 @@ void app_main(void)
     enc[0] = encoder_init(4, 5);
     enc[1] = encoder_init(6, 7);
     motor_hw_init();
+    bootloader_random_enable();
     boot_id = esp_random();
+    bootloader_random_disable();
     uart_init();
     if (xTaskCreate(control_task, "amr_pi_control", 6144, NULL, 7, NULL) != pdPASS) abort();
-    ESP_LOGI(TAG, "Phase 4L.6A: guarded normal and low-speed bench modes");
+    ESP_LOGI(TAG, "Phase 4L.7B: UART safe startup and guarded motion");
     ESP_LOGI(TAG, "Straight sync enabled=%d, kp=%.4f RPM/tick, cap=%.1f RPM",
         ENABLE_STRAIGHT_SYNC, (double)SYNC_KP_RPM_PER_TICK, (double)SYNC_MAX_CORR_RPM);
     ESP_LOGI(TAG, "PCNT x4 CPR=3960; L forward=LPWM; R forward=RPWM; UART1=57600");

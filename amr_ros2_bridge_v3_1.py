@@ -99,6 +99,8 @@ def exclusive_uart(port_name):
 
 
 class BridgeV31(GuardedBridge):
+    extended_version = '3.1'
+
     def __init__(self, uart, mode=Mode.READ_ONLY, low_rpm=None, **kwargs):
         self.mode = Mode(mode)
         if ((self.mode == Mode.LOW and (type(low_rpm) is not int or abs(low_rpm) not in LOW_CANDIDATES))
@@ -116,11 +118,13 @@ class BridgeV31(GuardedBridge):
         self.stop_verified = False
 
     def query(self):
-        reply = self.uart.exchange('Q', 'STATUS ', prefix=True)
+        return self._parse_feedback(self.uart.exchange('Q', 'STATUS ', prefix=True))
+
+    def _parse_feedback(self, reply):
         tokens = reply.split()
         versions = [token[3:] for token in tokens if token.startswith('PV=')]
         corrections = [token[3:] for token in tokens if token.startswith('SC=')]
-        if versions not in ([], ['3.1']) or len(versions) != len(corrections):
+        if versions not in ([], [self.extended_version]) or len(versions) != len(corrections):
             raise ProtocolError('invalid firmware version or sync fields in Q')
         try:
             correction = float(corrections[0]) if corrections else None
@@ -130,7 +134,7 @@ class BridgeV31(GuardedBridge):
             raise ProtocolError('straight-sync correction exceeds advertised bound')
         is_low = 'MODE=LOW' in tokens
         if is_low:
-            if versions != ['3.1'] or correction != 0:
+            if versions != [self.extended_version] or correction != 0:
                 raise ProtocolError('invalid low-mode feedback')
             # V3 validates all shared fields and the armed/mode invariants.
             tokens[tokens.index('MODE=LOW')] = 'MODE=CONT'
@@ -173,7 +177,7 @@ class BridgeV31(GuardedBridge):
             raise ProtocolError(f'firmware fault {feedback.reason}')
         if (feedback.boot, feedback.counters) != self.baseline:
             raise ProtocolError('firmware reset or fault counters changed')
-        if (self.feedback_version == '3.1') != self.extended_status:
+        if (self.feedback_version == self.extended_version) != self.extended_status:
             raise ProtocolError('firmware status version changed')
         if armed is not None and feedback.armed != armed:
             raise ProtocolError('unexpected firmware arm state')
