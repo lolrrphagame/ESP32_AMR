@@ -1064,3 +1064,208 @@ The adapter discarded one additionally delayed status and recovered.
 The mock UART received zero arm or velocity frames. A separate mock-UART
 DDS test verified STOP after command loss and no rearm on new samples.
 The robot stationary rerun and floor goal remain pending.
+
+## Phase 6D.8 telemetry isolation and real Nav2 launch
+
+The Pi's control timer called `/joint_states` publication inline. Phase
+6D.7 recorded **424.182 ms** in that call, **457.853 ms** in the timer and
+a **460.025 ms** timer interval. UART Q measured **30.385 ms** median and
+**47.205 ms** maximum. Status publication reached **20.561 ms**. Laptop
+timer spacing peaked at **40.870 ms** while its DDS status gap reached
+**2,821.550 ms**.
+
+The final accepted status had Pi source timestamp `1795810400386468555`
+and laptop receipt timestamp `1795810400388927588` ns. The final valid
+proof reply reached the Pi at `1795810400391241419` ns, **4.773 ms** after
+the status source on the same clock. The bridge faulted when the proof
+was **1.043 s** old. The adapter faulted after **1.040 s** without valid
+status. The 424 ms maximum first appeared in the Pi summary that
+reported the fault. These summaries establish that joint publication
+blocked the control timer. They do not resolve the sequence of delays
+across the entire 2.822 s DDS gap. [Pi diagnostic log](/home/tanloc/amr_debug/phase6d7/nav2_bridge_6d7.log:51)
+[Laptop diagnostic log](/home/tanloc/amr_debug/phase6d7/nav2_adapter_6d7.log:32)
+
+Nav2's bridge now hands each validated encoder measurement to a separate
+process through a single shared slot. The control timer skips a contended
+handoff. The publisher takes only a newer measurement and drops data
+older than 230 ms before calling DDS. It preserves the Q measurement
+timestamp in the JointState header. The existing reliable ROS topic and
+wheel joint names are retained. The worker has its own Python interpreter
+and DDS participant. UART, STOP, command checks and clock proof stay on
+the bridge executor. The authority status and clock challenge also stay
+on that executor with their existing QoS and deadlines.
+
+On local Humble with `rmw_fastrtps_cpp` 6.2.11, a native probe read the
+effective DataWriter QoS for both `/amr_bridge/status` and `/joint_states`
+as **ASYNCHRONOUS**. The Pi start command explicitly selects that mode and
+disables XML overrides of the writer mode. The effective writer QoS on
+the physical Pi still needs confirmation. [Humble Fast DDS publication configuration](https://github.com/ros2/rmw_fastrtps/blob/humble/README.md#change-publication-mode)
+
+### Deploy the two bridge files from the laptop
+
+Use the existing V3.3 deployment directory on the Pi. The commands below
+use the Pi address and directory from the previous run. The laptop
+adapter uses the same Phase 6D.5 files already in this checkout.
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+git switch phase6d-nav2-stable
+PI_HOST=ubuntu@192.168.50.11
+scp amr_ros2_bridge_v3_2.py amr_joint_telemetry.py "$PI_HOST:~/amr_uart_v33/"
+```
+
+### Start from closed terminals
+
+Isolate motor power and keep the physical cutoff within reach. Run this
+environment setup in **each terminal** on both hosts. On the laptop,
+also source the existing robot workspace.
+
+```bash
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# Laptop only
+source ~/dev_ws/install/setup.bash
+```
+
+Check synchronized clocks on both hosts with `chronyc tracking`. Keep
+the laptop adapter with the single local Nav2 Twist publisher so the
+existing Pi–laptop proof continues to cover the remote command path.
+
+**Pi terminal 1 · LiDAR.** If the driver is installed in an overlay, source
+that overlay first. These settings match the existing RPLIDAR launcher.
+
+```bash
+if [ -f "$HOME/dev_ws/install/setup.bash" ]; then source "$HOME/dev_ws/install/setup.bash"; fi
+ros2 run rplidar_ros rplidar_composition --ros-args \
+    -p serial_port:=/dev/ttyUSB0 -p serial_baudrate:=115200 \
+    -p frame_id:=laser_frame -p scan_mode:=Standard -p angle_compensate:=true
+```
+
+**Pi terminal 2 · Bridge and joint publisher.** Type
+`CLEAR_AREA_CUTOFF_READY` and copy the printed session ID. This command
+starts both bridge processes and logs them together.
+
+```bash
+cd ~/amr_uart_v33
+RMW_FASTRTPS_PUBLICATION_MODE=ASYNCHRONOUS RMW_FASTRTPS_USE_QOS_FROM_XML=0 \
+    python3 -B amr_ros2_bridge_v3_3.py --port /dev/serial0 --ground-control \
+    --source nav2 --session-seconds 30 --link-diagnostics 2>&1 | tee -a ~/nav2_bridge_6d8.log
+```
+
+**Laptop terminal 1 · Robot State Publisher.**
+
+```bash
+ros2 launch my_amr rsp.launch.py sim_mode:=false use_ros2_control:=false use_sim_time:=false
+```
+
+**Laptop terminal 2 · Wheel odometry.**
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+python3 -B amr_odom_from_joints.py
+```
+
+**Laptop terminal 3 · Saved map and AMCL.** Use the saved map for the
+current floor. This command uses the established home trial map.
+
+```bash
+ros2 launch nav2_bringup localization_launch.py \
+    map:="$HOME/dev_ws/maps/amr_home_trial_01.yaml" \
+    params_file:="$HOME/dev_ws/config/amcl_amr.yaml" use_sim_time:=False autostart:=True
+```
+
+**Laptop terminal 4 · RViz.** Select `2D Pose Estimate` and set the robot's
+actual map pose. Confirm the scan aligns with the saved map.
+
+```bash
+rviz2 -d "$HOME/dev_ws/config/amr_navigation.rviz"
+```
+
+**Laptop terminal 5 · Navigation.**
+
+```bash
+ros2 launch "$HOME/dev_ws/config/navigation_amr.launch.py" \
+    params_file:="$HOME/dev_ws/config/nav2_amr_real.yaml" use_sim_time:=False autostart:=True
+```
+
+**Laptop terminal 6 · Stationary adapter.** Paste the bridge session ID at
+`read`, then type `ACTIVATE <session-id>` at the prompt. The stationary
+mode leaves velocity forwarding disabled.
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+read -r SESSION
+python3 -B tools/amr_cmd_vel_adapter.py --session "$SESSION" --source nav2 \
+    --stationary-check --link-diagnostics 2>&1 | tee ~/nav2_adapter_6d8_stationary.log
+```
+
+**Laptop terminal 7 · Verify and send the short goal.** Confirm that
+`/joint_states` has one `amr_joint_telemetry` publisher, the Nav2 command
+topic has one publisher and the navigator is active. Wait for `OWNED`,
+`VERIFIED`, `READY` and `stationary_ready=true` with zero PWM and the
+firmware disarmed. Confirm the same healthy session after the timed run
+and check both logs for faults during that interval.
+
+```bash
+ros2 topic info -v /joint_states
+ros2 topic info -v /amr/nav2_cmd_vel
+ros2 lifecycle get /bt_navigator
+ros2 topic echo --once /amr_bridge/status
+timeout --signal=INT 125s ros2 topic hz /amr_bridge/status
+ros2 topic echo --once /amr_bridge/status
+```
+
+After the stationary check, stop the adapter and bridge with Ctrl+C. Wait
+for `Final STOP and stationary feedback verified` on the Pi. Restart the
+bridge in Pi terminal 2, then run the motion adapter in laptop terminal 6
+using the new session ID and a new `ACTIVATE` confirmation.
+
+```bash
+read -r SESSION
+python3 -B tools/amr_cmd_vel_adapter.py --session "$SESSION" --source nav2 \
+    --link-diagnostics 2>&1 | tee ~/nav2_adapter_6d8_motion.log
+```
+
+Verify the map pose, clear path, and healthy `OWNED` / `READY` status
+before enabling motor power. In laptop terminal 7, use the pose output
+to select a map goal approximately 0.25 m straight ahead with the same
+yaw. Enter goal X, Y and the current yaw quaternion Z and W after stopping
+`tf2_echo` with Ctrl+C.
+
+```bash
+ros2 run tf2_ros tf2_echo map base_link
+read -r X Y QZ QW
+ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
+    "{pose: {header: {frame_id: map}, pose: {position: {x: $X, y: $Y, z: 0.0}, orientation: {z: $QZ, w: $QW}}}}" \
+    --feedback
+ros2 topic echo --once /amr_bridge/status
+```
+
+Confirm `SUCCEEDED` and wait for the bridge to return to verified stationary
+`READY` with zero PWM and the firmware disarmed. After a fault, cut motor
+power, cancel the goal and stop the adapter and bridge. A host-only fault
+with healthy firmware can recover by restarting those two terminals and
+explicitly activating the new session. Keep LiDAR, odometry, localization
+and Nav2 running. If STOP is unverified or the firmware has a fault, keep
+motor power isolated while diagnosing it.
+
+### Verification results
+
+- All **109 Python regressions** and both native C suites passed.
+- The local full ROS stack ran for **120.001 s** using mock UART and
+  synthetic LiDAR. Native Fast DDS write calls were blocked for **450 ms**
+  and **1.2 s** in the joint publisher. The bridge timer's maximum
+  interval was **60.127 ms**, and the adapter's maximum DDS status
+  interval was **60.554 ms**. The mock firmware received zero arm or
+  velocity frames.
+- A local **0.28 m** `NavigateToPose` goal in a synthetic room succeeded
+  with motion observed on mock firmware. The bridge returned to verified
+  stationary `READY`, disarmed with zero PWM.
+- Separate mock-UART DDS runs verified STOP on source silence and when
+  the adapter process was suspended while raw commands continued.
+  New commands could not rearm either latched session. The isolation
+  regression also verifies STOP when an idle clock proof expires while
+  the joint publisher remains blocked.
+- Physical-Pi verification still requires the stationary run and short
+  floor goal above. The SSH host responded but did not accept the
+  available noninteractive credentials.

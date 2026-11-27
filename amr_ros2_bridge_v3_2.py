@@ -15,6 +15,7 @@ from amr_ground_protocol import (
     arrival_monotonic, check_dds_publisher, clock_proven, command_qos, inspect_publishers,
     metadata_executor, status_qos, telemetry_qos, token_valid,
 )
+from amr_joint_telemetry import JointTelemetry
 from amr_link_metrics import LinkMetrics, PeriodicLinkReport, summarize
 from amr_ros2_bridge_v3 import (
     CPR, DEADMAN_S, LOOP_PERIOD_S, MAX_ANGULAR_RPS, MAX_LINEAR_MPS, MAX_WHEEL_RPM,
@@ -98,6 +99,7 @@ class BridgeV32(BridgeV31):
         self.encoder_valid = False
         self.encoder_invalid_reason = None
         self.previous_encoder = None
+        self.feedback_stamp_ns = None
 
     def start(self):
         super().start()
@@ -109,6 +111,7 @@ class BridgeV32(BridgeV31):
         started = time.monotonic() if self.metrics else None
         try:
             feedback = super().query()
+            self.feedback_stamp_ns = self.wall_ns()
         finally:
             if self.metrics:
                 self.metrics.sample('uart_query_ms', (time.monotonic() - started) * 1000)
@@ -508,15 +511,17 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
     from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
     from sensor_msgs.msg import JointState
 
-    node = executor = None
+    node = executor = joint_telemetry = None
     result = 0
     metrics = None
     rclpy.init(args=[])
     try:
         executor = metadata_executor() if commissioning else SingleThreadedExecutor()
         node = rclpy.create_node('amr_serial_bridge')
-        joint_qos = telemetry_qos() if source == 'nav2' else 10
-        joint_pub = node.create_publisher(JointState, '/joint_states', joint_qos)
+        if source == 'nav2':
+            joint_telemetry = JointTelemetry(diagnostics)
+        else:
+            joint_pub = node.create_publisher(JointState, '/joint_states', 10)
         metrics = LinkMetrics('bridge') if diagnostics else None
         reporter = PeriodicLinkReport(metrics) if metrics else None
         with exclusive_uart(port) as uart:
@@ -531,13 +536,21 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
                         metrics.timer(LOOP_PERIOD_S, started)
                     if commissioning:
                         before_tick()
+                    if joint_telemetry is not None and not joint_telemetry.process.is_alive():
+                        bridge.latch('joint telemetry process exited')
                     previous = bridge.feedback
                     bridge.tick()
                     feedback = bridge.feedback
                     fresh_encoders = bridge.encoder_valid and feedback is not previous
-                    stamp = node.get_clock().now().to_msg() if fresh_encoders else None
+                    stamp = (node.get_clock().now().to_msg()
+                             if fresh_encoders and joint_telemetry is None else None)
                     publish()
-                    if fresh_encoders:
+                    if fresh_encoders and joint_telemetry is not None:
+                        handed_off = joint_telemetry.slot.submit(
+                            bridge.feedback_stamp_ns, bridge.feedback_at, feedback.ticks, feedback.measured)
+                        if metrics and not handed_off:
+                            metrics.event('joint_handoff_busy')
+                    elif fresh_encoders:
                         msg = JointState()
                         msg.header.stamp = stamp
                         msg.name = ['left_wheel_joint', 'right_wheel_joint']
@@ -576,6 +589,8 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
         print(f'Bridge stopped: {exc}', file=sys.stderr, flush=True)
         result = 1
     finally:
+        if joint_telemetry is not None:
+            joint_telemetry.close()
         if executor is not None:
             executor.shutdown()
         if node is not None:
