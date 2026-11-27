@@ -3,6 +3,7 @@
 import json
 from math import pi
 import multiprocessing
+import os
 from struct import Struct
 import sys
 import time
@@ -53,7 +54,11 @@ def run_publisher(slot, diagnostics):
     reporter = PeriodicLinkReport(metrics) if metrics else None
     parent = multiprocessing.parent_process()
     node = None
-    rclpy.init(args=[])
+    from amr_nav2_peer import public_domain
+    domain = public_domain()
+    if domain is not None:
+        os.environ['ROS_LOCALHOST_ONLY'] = '0'
+    rclpy.init(args=[], domain_id=domain)
     try:
         node = rclpy.create_node('amr_joint_telemetry', start_parameter_services=False,
                                  enable_rosout=False)

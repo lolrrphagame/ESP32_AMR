@@ -58,7 +58,9 @@ class WheelOdom(Node):
         if not (math.isfinite(left) and math.isfinite(right)):
             return
 
-        stamp = self.get_clock().now().to_msg()
+        # Carry the encoder measurement time through odom and TF, including
+        # when DDS delivers an in-flight joint sample late.
+        stamp = msg.header.stamp
         t = stamp.sec + stamp.nanosec * 1e-9
 
         if self.prev is None:
@@ -72,10 +74,12 @@ class WheelOdom(Node):
         dl_rad = left - pl
         dr_rad = right - pr
 
+        if dt <= 0.0:
+            return
         self.prev = (left, right, t)
 
         # Reject stale samples or unexpected encoder jumps.
-        if (dt <= 0.0 or dt > 1.0
+        if (dt > 1.0
                 or abs(dl_rad) > 2.0
                 or abs(dr_rad) > 2.0):
             self.get_logger().warning(

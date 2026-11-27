@@ -100,6 +100,7 @@ class BridgeV32(BridgeV31):
         self.encoder_invalid_reason = None
         self.previous_encoder = None
         self.feedback_stamp_ns = None
+        self.pi_nav2 = False
 
     def start(self):
         super().start()
@@ -207,7 +208,7 @@ class BridgeV32(BridgeV31):
         if kind == 'fault' and self.activation is not None:
             try:
                 check_dds_publisher(info, self.owner_endpoints[1])
-                DDSStamp.read(info, self.clock.check(), remote=True)
+                DDSStamp.read(info, self.clock.check(), remote=not self.pi_nav2)
             except AuthorityError as exc:
                 self.latch(str(exc))
             else:
@@ -295,9 +296,13 @@ class BridgeV32(BridgeV31):
                 self.require_fresh()
             wall = self.clock.check()
             check_dds_publisher(info, self.owner_endpoints[0])
-            dds = DDSStamp.read(info, wall, remote=True)
+            dds = DDSStamp.read(info, wall, remote=not self.pi_nav2)
             age = wall - stamp.source_ns + CLOCK_OFFSET_NS
-            if not (stamp.source_ns <= stamp.receipt_ns <= dds.source and 0 <= age < DEADMAN_NS):
+            # Pi ingress preserves both laptop timestamps. DDS publication is on the Pi.
+            if self.pi_nav2 != (stamp.health_until_ns is not None):
+                raise AuthorityError('command clock domain mismatch')
+            receipt_limit = dds.source + (CLOCK_OFFSET_NS if self.pi_nav2 else 0)
+            if not (stamp.source_ns <= stamp.receipt_ns <= receipt_limit and 0 <= age < DEADMAN_NS):
                 raise AuthorityError('stale original command or inconsistent adapter receipt stamp')
             self.last_source = stamp.source_ns
             self.last_stamp = stamp
@@ -324,6 +329,11 @@ class BridgeV32(BridgeV31):
             if active and directions(self.sent) != directions(self.limited):
                 self.begin_stop('DIRECTION_OR_DRIVEN_WHEEL_CHANGE')
                 return
+            if self.pi_nav2:
+                remaining = stamp.health_until_ns - wall - CLOCK_OFFSET_NS
+                if remaining <= 0:
+                    raise AuthorityError('navigation feedback expired')
+                age = max(age, DEADMAN_NS - remaining)
             self.command_at = self.now() - age / NS
         except (ValueError, RuntimeError, OSError) as exc:
             # Reject invalid numeric values without putting NaN/Inf on status JSON.
@@ -400,7 +410,7 @@ class BridgeV32(BridgeV31):
         result.update({
             'version': '3.2', 'bridge_mode': self.commissioning or 'read-only',
             'session_id': self.session, 'authority_state': status, 'adapter_activation': self.activation,
-            'clock_status': self.clock_status, 'clock_proof_age_s': self.clock_proof_age(),
+            'pi_nav2': self.pi_nav2, 'clock_status': self.clock_status, 'clock_proof_age_s': self.clock_proof_age(),
             'command_source': self.source,
             'session_state': ('DISABLED' if not self.commissioning else
                               'INHIBITED' if self.state == State.FAULT_LATCHED else
@@ -501,6 +511,10 @@ def attach_bridge_link(node, executor, bridge, *, status_topic=STATUS_TOPIC,
 
 
 def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *, bridge_class=BridgeV32):
+    from amr_nav2_peer import public_domain
+    domain = public_domain()
+    if domain is not None and source != 'nav2':
+        raise AuthorityError('private motor domain requires Nav2')
     if source == 'nav2':
         # Let Fast DDS send telemetry on its worker. A Python publishing
         # thread would still hold the GIL inside Humble's rcl_publish binding.
@@ -526,6 +540,7 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
         reporter = PeriodicLinkReport(metrics) if metrics else None
         with exclusive_uart(port) as uart:
             bridge = bridge_class(uart, commissioning, source, duration, limits, metrics=metrics)
+            bridge.pi_nav2 = domain is not None
             before_tick, publish = attach_bridge_link(node, executor, bridge)
             try:
                 bridge.start()

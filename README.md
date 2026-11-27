@@ -1,5 +1,7 @@
 # ESP32 AMR firmware and ROS 2 bridge
 
+For real Nav2 operation with the Pi-local Command Adapter, follow the [Phase 6D.10 deployment and terminal guide](docs/pi-local-nav2.md).
+
 For the current firmware and Bridge V3.3, follow [Phase 4L.7B UART safe
 startup](#phase-4l7b-uart-safe-startup). The V3.1 and V3.2 procedures below
 document the previous release and are also used for rollback.

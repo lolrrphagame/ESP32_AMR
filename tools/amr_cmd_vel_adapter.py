@@ -24,7 +24,7 @@ from amr_ros2_bridge_v3_1 import twist_components
 class CommandAdapter:
     def __init__(self, session, source, send_velocity, send_control, *,
                  now=time.monotonic, wall_ns=time.time_ns, activation=None, metrics=None,
-                 stationary_check=False):
+                 stationary_check=False, remote_nav2=False):
         if not token_valid(session) or source not in SOURCE_TOPICS:
             raise ValueError('valid bridge session and exactly one source required')
         self.session, self.source = session, source
@@ -34,6 +34,7 @@ class CommandAdapter:
         self.clock = WallClockGuard(now, wall_ns)
         self.send_velocity, self.send_control = send_velocity, send_control
         self.stationary_check = stationary_check
+        self.remote_nav2 = remote_nav2
         self.bridge_gid = None
         self.raw_candidate = self.raw_owner = None
         self.discovered_at = None
@@ -110,6 +111,9 @@ class CommandAdapter:
             self.status_result('rejected', 'mode_or_source')
             self.fault('bridge mode or selected source mismatch')
             return
+        if bool(message.get('pi_nav2')) != self.remote_nav2:
+            self.fault('bridge and adapter Nav2 origin mode mismatch')
+            return
         expected = message.get('adapter_activation')
         if expected is not None and expected != self.activation:
             self.status_result('rejected', 'activation_mismatch')
@@ -129,7 +133,7 @@ class CommandAdapter:
                 raise AuthorityError('DDS status timestamps unavailable')
             t2, sent = info.get('received_timestamp'), info.get('source_timestamp')
             if owned or message.get('state') == 'FAULT_LATCHED':
-                DDSStamp.read(info, wall, remote=True)
+                DDSStamp.read(info, wall, remote=not self.remote_nav2)
             elif (type(t2) is not int or type(sent) is not int or sent <= 0 or t2 <= 0
                   or not 0 <= wall - t2 < DEADMAN_NS):
                 raise AuthorityError('invalid or stale DDS status metadata')
@@ -184,6 +188,9 @@ class CommandAdapter:
             self.last_motion_source = None
         self.bridge_allows_commands = (link_verified and not self.idle_status_paused
                                        and message.get('state') in ('READY', 'STARTING', 'RUNNING'))
+        # Establish the remote writer and clock before granting local ground authority.
+        if self.remote_nav2 and self.raw_owner is None:
+            return
         t1 = message.get('clock_probe_ns')
         if type(t1) is not int or t1 <= 0 or not 0 <= sent - t1 < CLOCK_OFFSET_NS:
             if self.metrics:
@@ -203,7 +210,7 @@ class CommandAdapter:
     def status_overdue(self):
         return self.last_status_at is not None and self.now() - self.last_status_at >= self.status_deadline()
 
-    def sample(self, twist, info):
+    def sample(self, twist, info, *, remote_stamp=None, health_until=None):
         if self.fault_reason or self.raw_owner is None:
             return
         if self.status_overdue():
@@ -215,11 +222,17 @@ class CommandAdapter:
         try:
             wall = self.clock.check()
             check_dds_publisher(info, self.raw_owner)
-            stamp = DDSStamp.read(info, wall)
+            if self.remote_nav2:
+                if remote_stamp is None:
+                    raise AuthorityError('missing verified remote Nav2 sample')
+                stamp = remote_stamp
+            else:
+                stamp = DDSStamp.read(info, wall)
             if self.source != 'nav2' and self.last_source is not None and wall - self.last_source >= DEADMAN_NS:
                 self.fault('selected source arrival gap', (wall - self.last_source) / NS)
                 return
-            if stamp.source <= self.raw_cutoff or (
+            skew = CLOCK_OFFSET_NS if self.remote_nav2 else 0
+            if stamp.source - skew <= self.raw_cutoff or (
                     self.last_source is not None and stamp.source <= self.last_source):
                 return
             components = twist_components(twist)
@@ -231,7 +244,7 @@ class CommandAdapter:
         if self.bridge_allows_commands and not self.stationary_check:
             if self.source == 'nav2' and any(components):
                 self.last_motion_source = stamp.source
-            header = CommandStamp(self.session, self.activation, self.source, stamp.source, stamp.received)
+            header = CommandStamp(self.session, self.activation, self.source, stamp.source, stamp.received, health_until)
             self.send_velocity(twist, header)
 
     def tick(self):
@@ -248,7 +261,7 @@ class CommandAdapter:
             self.fault(str(exc))
 
 
-def attach_adapter(node, executor, adapter, raw_topic, status_topic=STATUS_TOPIC, reporter=None):
+def attach_adapter(node, executor, adapter, raw_topic, status_topic=STATUS_TOPIC, reporter=None, ingress=None):
     from geometry_msgs.msg import Twist
     from rclpy.clock import Clock, ClockType
     from std_msgs.msg import String
@@ -256,7 +269,10 @@ def attach_adapter(node, executor, adapter, raw_topic, status_topic=STATUS_TOPIC
     metrics = adapter.metrics
 
     def observe():
-        raw = inspect_publishers(node, raw_topic, metrics)
+        if ingress is None:
+            raw = inspect_publishers(node, raw_topic, metrics)
+        else:
+            raw = (ingress.gid,) if ingress.gid is not None else ()
         bridge = inspect_publishers(node, status_topic, metrics)
         adapter.observe(raw, bridge)
 
@@ -308,17 +324,36 @@ def attach_adapter(node, executor, adapter, raw_topic, status_topic=STATUS_TOPIC
 
     status_sub = executor.subscribe(node, String, status_topic, on_status, status_qos(),
                                     metrics=metrics, channel='status')
-    executor.subscribe(node, Twist, raw_topic, on_source, command_qos())
+    if ingress is None:
+        executor.subscribe(node, Twist, raw_topic, on_source, command_qos())
+    else:
+        def remote_sample(values, stamp, health_until):
+            observe()
+            drain_status()
+            msg = Twist()
+            msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.x, msg.angular.y, msg.angular.z = map(float, values)
+            adapter.sample(msg, {'publisher_gid': ingress.gid}, remote_stamp=stamp, health_until=health_until)
+
+        def poll():
+            if adapter.fault_reason is None:
+                try:
+                    ingress.poll(remote_sample)
+                except (AuthorityError, OSError, TypeError, ValueError) as exc:
+                    adapter.fault(str(exc))
+        node.create_timer(.004, poll, clock=Clock(clock_type=ClockType.STEADY_TIME))
     node.create_timer(.04, tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
 
-def run_ros(session, source, diagnostics=False, *, stationary_check=False):
+def run_ros(session, source, diagnostics=False, *, stationary_check=False, laptop=None):
     import rclpy
     from geometry_msgs.msg import TwistStamped
     from rclpy.executors import ExternalShutdownException
     from std_msgs.msg import String
 
-    node = executor = adapter = None
+    from amr_nav2_peer import PeerSocket, PiIngress, public_domain
+    if bool(laptop) != (public_domain() is not None) or (laptop and source != 'nav2'):
+        raise AuthorityError('use --laptop with the Pi private Nav2 domain')
+    node = executor = adapter = link = None
     rclpy.init(args=[])
     result = 0
     metrics = None
@@ -343,9 +378,11 @@ def run_ros(session, source, diagnostics=False, *, stationary_check=False):
 
         metrics = LinkMetrics('adapter') if diagnostics else None
         adapter = CommandAdapter(session, source, send_velocity, send_control, metrics=metrics,
-                                 stationary_check=stationary_check)
+                                 stationary_check=stationary_check, remote_nav2=bool(laptop))
+        link = PeerSocket(session, laptop, pi=True) if laptop else None
         attach_adapter(node, executor, adapter, SOURCE_TOPICS[source],
-                       reporter=PeriodicLinkReport(metrics) if metrics else None)
+                       reporter=PeriodicLinkReport(metrics) if metrics else None,
+                       ingress=PiIngress(link, adapter) if link else None)
         executor.add_node(node)
         executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
@@ -357,6 +394,8 @@ def run_ros(session, source, diagnostics=False, *, stationary_check=False):
         if adapter is not None:
             result = int(bool(result or adapter.fault_reason))
             adapter.fault('operator cancelled adapter')
+        if link is not None:
+            link.sock.close()
         if executor is not None:
             executor.shutdown()
         if node is not None:
@@ -372,6 +411,7 @@ def main():
     parser.add_argument('--session', required=True, help='session ID printed by the Pi bridge')
     parser.add_argument('--source', required=True, choices=SOURCE_TOPICS)
     parser.add_argument('--link-diagnostics', action='store_true', help='emit bounded link summaries')
+    parser.add_argument('--laptop', help='trusted Nav2 source host for Pi-local operation')
     parser.add_argument('--stationary-check', action='store_true',
                         help='exercise ownership and clock proof with velocity forwarding disabled')
     args = parser.parse_args()
@@ -380,7 +420,8 @@ def main():
     if not sys.stdin.isatty():
         return 1
     try:
-        received = input(f'Confirm single local {args.source} publisher, isolated trusted LAN and '
+        host = args.laptop or 'this host'
+        received = input(f'Confirm one {args.source} publisher on {host}, isolated trusted LAN and '
                          f'synchronized Pi/laptop clocks. Type ACTIVATE {args.session}: ')
     except (EOFError, KeyboardInterrupt):
         return 1
@@ -388,7 +429,7 @@ def main():
         return 1
     try:
         return run_ros(args.session, args.source, args.link_diagnostics,
-                       stationary_check=args.stationary_check)
+                       stationary_check=args.stationary_check, laptop=args.laptop)
     except ImportError as exc:
         print(f'Adapter dependency unavailable: {exc}', file=sys.stderr, flush=True)
         return 1

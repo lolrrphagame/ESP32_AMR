@@ -90,14 +90,21 @@ class CommandStamp:
     source: str
     source_ns: int
     receipt_ns: int
+    health_until_ns: int | None = None
 
     @property
     def frame(self):
+        if self.health_until_ns is not None:
+            return f'amr-pi/{self.session}/{self.activation}/nav2/{self.source_ns}/{self.health_until_ns}'
         return f'amr-v3.2/{self.session}/{self.activation}/{self.source}/{self.source_ns}'
 
     @classmethod
     def from_header(cls, header):
         parts = header.frame_id.split('/')
+        health_until = None
+        if len(parts) == 6 and parts[0] == 'amr-pi' and parts[3] == 'nav2' and re.fullmatch(r'[0-9]{1,19}', parts[5]):
+            health_until = int(parts.pop())
+            parts[0] = 'amr-v3.2'
         if (len(parts) != 5 or parts[0] != 'amr-v3.2'
                 or not token_valid(parts[1]) or not token_valid(parts[2])
                 or parts[3] not in SOURCE_TOPICS or not re.fullmatch(r'[1-9][0-9]{0,18}', parts[4])):
@@ -105,7 +112,7 @@ class CommandStamp:
         stamp = header.stamp
         if stamp.sec <= 0 or not 0 <= stamp.nanosec < NS:
             raise AuthorityError('invalid adapter receipt stamp')
-        return cls(parts[1], parts[2], parts[3], int(parts[4]), stamp.sec * NS + stamp.nanosec)
+        return cls(parts[1], parts[2], parts[3], int(parts[4]), stamp.sec * NS + stamp.nanosec, health_until)
 
 
 def check_dds_publisher(info, expected):
