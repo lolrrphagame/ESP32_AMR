@@ -41,6 +41,7 @@ class CommandAdapter:
         self.raw_cutoff = self.clock.check()
         self.last_status_at = self.last_probe_at = None
         self.last_source = None
+        self.pre_arm_stop = False
         self.last_motion_source = None
         self.verified_idle = False
         self.idle_status_paused = False
@@ -168,6 +169,9 @@ class CommandAdapter:
         if self.idle_status_paused and verified_idle:
             self.raw_cutoff = wall
             self.idle_status_paused = False
+        self.pre_arm_stop = (verified_idle and message.get('stop_verified') is True
+                             and message.get('session_state') == 'AWAITING_FIRST_ARM'
+                             and message.get('requested_body') in (None, [0., 0.], (0., 0.)))
         self.verified_idle = verified_idle
         self.bridge_gid = publishers[0]
         self.last_status_at = received_at

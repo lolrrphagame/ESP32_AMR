@@ -64,6 +64,8 @@ cleanup
 trap - EXIT
 if [[ "$mode" == idle ]]; then
     rg -q '^Test joint write delay 1200 ms' "$dir/bridge.log"
+    rg -q '"remote_clock_proven":' "$dir/adapter.log"
+    if rg -q '"remote_prearm_expiry":' "$dir/adapter.log"; then exit 1; fi
     counts=$(rg '^UART COUNTS' "$dir/bridge.log")
     [[ "$counts" != *"'ARM_CONT'"* && "$counts" != *"'V'"* ]]
 fi

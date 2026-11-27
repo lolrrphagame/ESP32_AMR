@@ -53,7 +53,7 @@ class PiNav2Test(unittest.TestCase):
         self.clock.seconds += .005
         t2 = t1 + 1_000_000 + offset
         return ['cmd', 'challenge', 'instance', self.writer, t2, t2 + 1_000_000,
-                t2 if source is None else source, t2 + 1, [.04, 0., 0., 0., 0., 0.], t1 + health]
+                t2 if source is None else source, t2 + 1, [.04, 0., 0., 0., 0., 0.], t1 + health, t1]
 
     def test_local_bridge_preserves_both_remote_stamps_and_discards_reordered_motion(self):
         cmd = self.packet()
@@ -87,6 +87,51 @@ class PiNav2Test(unittest.TestCase):
         self.clock.seconds += 1.
         with self.assertRaisesRegex(AuthorityError, 'clock proof expired'):
             self.ingress.poll(self.sample)
+
+    def test_pre_arm_expiry_reproves_but_requires_new_activation_and_goal(self):
+        ready = ['ready', *self.packet()[1:6]]
+        self.ingress.accept(ready, self.sample)
+        for _ in range(18):
+            self.driver.tick(renew=True)
+            self.adapter.status(self.bridge.status(), self.info(ground.STATUS_GID), (ground.STATUS_GID,))
+        self.assertTrue(self.adapter.pre_arm_stop)
+        self.assertIsNone(self.adapter.fault_reason)
+        self.ingress.link.receive.return_value = []
+        self.ingress.poll(self.sample)
+        self.assertTrue(self.ingress.inhibited)
+        self.assertIsNone(self.ingress.proof_at)
+        self.ingress.accept(ready, self.sample)  # Old challenge cannot reprove.
+        self.assertIsNone(self.ingress.proof_at)
+        self.ingress.accept(['ready', *self.packet()[1:6]], self.sample)
+        self.assertIsNotNone(self.ingress.proof_at)
+        self.ingress.accept(self.packet(), self.sample)
+        self.assertIsNone(self.bridge.command_at)
+        self.assertTrue(self.bridge.stop_verified)
+        self.setUp()  # New session and explicit adapter activation.
+        old_goal = self.packet()
+        old_goal[-1] = self.adapter.raw_cutoff
+        self.ingress.accept(old_goal, self.sample)
+        self.assertIsNone(self.bridge.command_at)
+        self.ingress.accept(self.packet(), self.sample)
+        self.assertIsNotNone(self.bridge.command_at)
+
+    def test_pending_and_active_nonzero_make_expiry_latch(self):
+        for active in (False, True):
+            with self.subTest(active=active):
+                self.setUp()
+                self.ingress.accept(self.packet(), self.sample)
+                if active:
+                    self.driver.tick()
+                    self.driver.tick()
+                    self.assertEqual(self.bridge.state, State.RUNNING)
+                else:
+                    self.assertFalse(self.driver.serial.armed)
+                self.clock.seconds += 1.
+                with self.assertRaisesRegex(AuthorityError, 'proof expired') as error:
+                    self.ingress.poll(self.sample)
+                self.adapter.fault(str(error.exception))
+                self.assertTrue(self.bridge.stop_verified)
+                self.assertEqual(self.bridge.state, State.FAULT_LATCHED)
 
     def test_clock_step_and_writer_replacement_fault(self):
         self.ingress.accept(['ready', *self.packet()[1:6]], self.sample)

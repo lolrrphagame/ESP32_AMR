@@ -3,6 +3,10 @@
 import argparse
 import ctypes as ct
 import math
+import multiprocessing
+import socket
+import json
+import select
 from pathlib import Path
 import secrets
 import sys
@@ -61,12 +65,34 @@ class FeedbackWindow:
         return min(self.stamps.values()) + 300_000_000 - CLOCK_OFFSET_NS
 
 
+def clock_responder(link, channel, instance, clock):
+    # No ROS or DDS operations in this process. It can prove time only.
+    while multiprocessing.parent_process().is_alive():
+        if not select.select([link.sock], [], [], .1)[0]:
+            continue
+        for (nonce,) in link.receive():
+            try:
+                t2 = clock.check()
+                challenge = [nonce, t2, time.monotonic()]
+                link.send(['clock', nonce, instance, None, t2, clock.check()])
+            except AuthorityError as exc:
+                link.send(['fault', nonce, instance, None, 0, 0, str(exc)])
+                return
+            try:
+                channel.send(json.dumps(challenge).encode())
+            except BlockingIOError:
+                pass
+
+
 def run(session, pi, library, tolerance):
     import rclpy
+    from action_msgs.msg import GoalStatus, GoalStatusArray
+    from rclpy.qos import qos_profile_action_status_default
     from geometry_msgs.msg import Twist
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import LaserScan
     from tf2_msgs.msg import TFMessage
+    from rclpy._rclpy_pybind11 import RCLError
     from rclpy.executors import ExternalShutdownException
     from rclpy.qos import qos_profile_sensor_data
     from rclpy.utilities import get_rmw_implementation_identifier
@@ -91,6 +117,24 @@ def run(session, pi, library, tolerance):
     node.create_subscription(Odometry, '/odom', health.odom, qos_profile_sensor_data)
     node.create_subscription(TFMessage, '/tf', health.tf, qos_profile_sensor_data)
     instance = secrets.token_hex(16)
+    goal_at = 0
+    def goals(msg):
+        nonlocal goal_at
+        unresolved = [s for s in msg.status_list if s.status in
+                      (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING, GoalStatus.STATUS_CANCELING)]
+        goal_at = 0
+        if len(unresolved) == 1 and unresolved[0].status == GoalStatus.STATUS_EXECUTING:
+            stamp = unresolved[0].goal_info.stamp
+            goal_at = stamp.sec * NS + stamp.nanosec
+    node.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status', goals,
+                             qos_profile_action_status_default)
+    rx, tx = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    rx.setblocking(False)
+    tx.setblocking(False)
+    worker = multiprocessing.get_context('spawn').Process(
+        target=clock_responder, args=(link, tx, instance, clock), daemon=True)
+    worker.start()
+    tx.close()
     local_prefix = None
     owner = challenge = fault = None
     last_source = next_graph = 0
@@ -101,8 +145,12 @@ def run(session, pi, library, tolerance):
                 clock.check()
             except AuthorityError as exc:
                 fault = str(exc)
-            for (nonce,) in link.receive():
-                challenge = nonce, time.time_ns(), time.monotonic()
+            for _ in range(8):
+                try:
+                    challenge = json.loads(rx.recv(256))
+                except BlockingIOError:
+                    break
+                nonce = challenge[0]
                 if fault:
                     link.send(['fault', nonce, instance, owner, 0, 0, fault])
                 elif owner:
@@ -155,14 +203,20 @@ def run(session, pi, library, tolerance):
                 if any(values) and wall >= until:
                     raise AuthorityError('stale scan, odometry or localization')
                 link.send(['cmd', nonce, instance, owner, t2, clock.check(),
-                           stamp.source, stamp.received, list(values), until])
+                           stamp.source, stamp.received, list(values), until, goal_at])
             except (AuthorityError, ValueError) as exc:
                 if fault is None:
                     fault = str(exc)
                     print(f'Nav2 source inhibited: {fault}', file=sys.stderr, flush=True)
     except ExternalShutdownException:
         pass
+    except RCLError:
+        if rclpy.ok():
+            raise
     finally:
+        worker.terminate()
+        worker.join()
+        rx.close()
         link.sock.close()
         reader.destroy_node()
         node.destroy_node()

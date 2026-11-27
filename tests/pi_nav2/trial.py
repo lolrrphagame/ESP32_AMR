@@ -112,6 +112,15 @@ def active():
 spin_until(active, 20)
 mode = sys.argv[1]
 if mode == 'idle':
+    # Suspend the whole ROS ingress process (including native callbacks) longer
+    # than proof lifetime. The separate UDP responder must stay timely.
+    source_pid = int(os.environ['AMR_TEST_SOURCE_PID'])
+    os.kill(source_pid, signal.SIGSTOP)
+    try:
+        paused_at = time.monotonic()
+        spin_until(lambda: time.monotonic() - paused_at >= 1.35, 2)
+    finally:
+        os.kill(source_pid, signal.SIGCONT)
     first = time.monotonic()
     def stationary():
         assert status['stationary_ready'] and status['stop_verified'] and status['authority_state'] == 'OWNED'

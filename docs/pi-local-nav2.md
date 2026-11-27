@@ -12,6 +12,26 @@ A second process for authority status would put a queue between the UART observa
 
 The laptop also checks scan, wheel odometry and AMCL map-to-odom measurement times. It subtracts AMCL's configured future dating from the TF stamp. The earliest feedback expiry accompanies each nonzero command and bounds how long the Bridge may drive. Wheel odometry now carries the actual encoder measurement stamp. The feedback window uses the deployed RPP transform tolerance of 0.3 s and accounts for clock uncertainty. The controller's collision check, 5 RPM wheel minimum, speed limits, explicit activation, verified STOP and 300 ms firmware heartbeat retain their existing settings.
 
+## Phase 6D.12 upgrade from a running 6D.10 installation
+
+The physical 6D.10 stationary run passed at 120.050 s. In the later motion-enabled session the adapter expired the **remote** one-second proof before ARM. The bridge's local proof age at fault was 0.178267 s. The adapter had accepted 865 statuses, sent 330 local responses and counted 30 rejected remote exchanges. Its last logged valid remote bounds were [−6.429325, +1.867438] ms. The source log was empty. The records omit individual rejected reply times and cannot distinguish network delay, clock uncertainty or laptop scheduling in the final second.
+
+The previous source serviced UDP only after spinning ROS, sharing its loop with graph inspection and native DDS reads. A dedicated laptop process now answers clock challenges immediately and passes their original receipt times to the ROS process. Its replies cannot establish publisher identity or send velocity. The ROS process still verifies the writer, timestamps and navigation feedback on every movement command. The Pi requires a single executing NavigateToPose goal accepted after the adapter's activation cutoff. Use the NavigateToPose interface below.
+
+With the previous terminals closed and motor power isolated, run on the **laptop**:
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+git switch phase6d-nav2-stable
+PI_HOST=ubuntu@192.168.50.11
+scp amr_nav2_peer.py "$PI_HOST:~/amr_uart_v33/"
+scp tools/amr_cmd_vel_adapter.py "$PI_HOST:~/amr_uart_v33/tools/"
+```
+
+Use the updated laptop source directly from this checkout and the native reader already built for 6D.10. Continue at **Start with all terminals closed** below. The fresh-install commands in the next section are for hosts still on the older baseline.
+
+On pre-ARM expiry with fresh, verified stationary STOP, the adapter prints **Motion locked**. It keeps the bridge stopped and continues probing. Successful re-verification prints **Motion remains locked**. Monitor the Pi adapter terminal as well as bridge status; the bridge can report local READY and VERIFIED throughout this inhibit. Use the cancel command and new-session procedure below, explicitly activate, then submit a new goal. A session that has seen a nonzero command, including one still awaiting ARM, takes the latched fault path on expiry.
+
 ## Deploy from the laptop
 
 These commands target the existing Phase 6D.8 Pi installation, Humble system Python, Pi `192.168.50.11` and laptop `192.168.50.10`. Use these checkout files, including the new source and native reader, on the laptop. Stop previous motor-control processes and isolate motor power before deploying.
@@ -162,6 +182,21 @@ rclpy.shutdown()
 PY
 ```
 
+In Pi terminal 4, confirm the stationary adapter received independent clock replies and experienced zero pre-ARM inhibits before proceeding. The bridge monitor measures the local authority link.
+
+```bash
+python3 - <<'CHECK'
+import json
+from pathlib import Path
+log = (Path.home() / 'nav2_adapter_6d10_stationary.log').read_text()
+assert 'Motion locked' not in log and 'remote Nav2 clock proof expired' not in log, 'restart after recovery'
+rows = [json.loads(line[line.index('{"role":'):]) for line in log.splitlines() if '{"role":' in line]
+assert rows and rows[-1]['counts'].get('remote_clock_proven', 0) > 0, 'no independent clock proof'
+assert not rows[-1]['counts'].get('remote_prearm_expiry'), 'remote proof expired'
+print('Remote clock verified throughout the stationary check')
+CHECK
+```
+
 ## First short floor goal and recovery
 
 1. After the stationary check, Ctrl+C Pi terminal 3, laptop terminal 6 and Pi terminal 2. Confirm `Final STOP and stationary feedback verified`. Leave LiDAR, odometry, AMCL, RViz and Nav2 running.
@@ -190,10 +225,16 @@ PY
 
 5. Confirm `SUCCEEDED` in laptop terminal 7 and repeat the Pi terminal 4 status command. Require verified stationary STOP, disarmed firmware and zero PWM. A zero from Nav2 permits ordinary goal completion. Loss of a live movement stream latches STOP.
 
-For a fault, use the physical cutoff and cancel outstanding goals from laptop terminal 7. A cancellation request with an empty goal ID and zero timestamp selects all goals.
+For a pre-ARM motion lock or a fault, use the physical cutoff and cancel outstanding goals from laptop terminal 7. A cancellation request with an empty goal ID and zero timestamp selects all goals.
 
 ```bash
 ros2 service call /navigate_to_pose/_action/cancel_goal action_msgs/srv/CancelGoal '{}'
+```
+
+Wait for any outstanding action to reach a terminal state before creating a new motion session. On laptop terminal 7, inspect the status array after cancellation. Every listed goal must have terminal status 4, 5 or 6 (succeeded, canceled or aborted), or the array may be empty.
+
+```bash
+ros2 topic echo --once --qos-durability transient_local /navigate_to_pose/_action/status action_msgs/msg/GoalStatusArray
 ```
 
 With motor power isolated, inspect Pi terminal 4 for the fault reason and STOP feedback. For a host-only fault with healthy firmware and verified STOP, repeat steps 1–3 with a new session and activation. A firmware fault or unverified STOP requires diagnosis with motor power isolated. Keep the existing localization and saved map for retries.
@@ -215,12 +256,12 @@ bash tests/pi_nav2/run.sh goal
 bash tests/pi_nav2/run.sh loss
 ```
 
-All **118 Python tests** and **both native C suites** passed. The local full-stack trials used the installed Humble controller, planner, navigator and AMCL with the V3.3 mock UART.
+All **120 Python tests** and **both native C suites** passed. The local full-stack trials used the installed Humble controller, planner, navigator and AMCL with the V3.3 mock UART.
 
 | Trial | Observed result |
 |---|---|
-| Stationary with injected joint writes of 450 ms and 1,200 ms | 120.008 s owned and stationary. Mock UART received zero arm or velocity frames. Maximum bridge timer interval was 60.169 ms, private status publish was 0.069 ms, and adapter DDS status interval was 60.572 ms. |
-| 0.28 m NavigateToPose | Action returned SUCCEEDED. Mock firmware received one arm and 110 velocity frames. Bridge returned to READY with verified STOP, disarmed firmware and zero PWM. |
+| ROS source suspended for 1.35 s, plus injected joint writes of 450 ms and 1,200 ms | Remote proof remained valid during suspension. The following stationary interval lasted 120.005 s. Across the run, the adapter accepted 2,440 independent clock replies. Mock UART received zero arm or velocity frames. |
+| 0.28 m NavigateToPose | Action returned SUCCEEDED. Mock firmware executed the goal. Bridge returned to READY with verified STOP, disarmed firmware and zero PWM. |
 | Remote source suspended during motion | Bridge latched the command deadman and verified STOP. Source resumed, and the trial observed one more second disarmed. Mock UART recorded one arm for the entire session. |
 
 These runs used loopback between two ROS domains on the laptop. The two-host latency, physical stationary run, hardware loss/STOP and short floor goal require verification on the robot. Noninteractive SSH reached the Pi and was denied authentication.
