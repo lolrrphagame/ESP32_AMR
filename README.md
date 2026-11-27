@@ -834,3 +834,153 @@ that image manually. On the Pi and DDS host, use the previous deployment
 from the same revision. Start `amr_ros2_bridge_v3_2.py --port /dev/serial0`
 in read-only mode and confirm protocol 3.1 and verified stationary STOP
 with motor power still isolated.
+
+## Phase 6D.3 real Nav2 trial
+
+The laptop retry log recorded a 234.75 ms DDS receipt gap before the first
+goal. The late sample's Pi source timestamp was 205.66 ms after the previous
+laptop receipt on the two hosts' clocks. Adapter callback delay peaked at
+0.304 ms and timer intervals peaked at 40.20 ms. The receipt gap had already
+occurred before adapter processing. The Pi retry log requires a Pi login
+to distinguish delays in UART, DDS publication and Pi scheduling. On the
+next run compare the bridge's `uart_query_ms`,
+`status_publish_ms`, `joint_publish_ms`, `timer_execution_ms` and
+`timer_interval_ms` with the adapter's DDS receipt intervals.
+
+For Nav2, the bridge defaults to asynchronous publication with Fast DDS.
+Status is queued before joint telemetry. Both writers keep only the latest
+sample with a 230 ms lifespan and remain compatible with reliable readers.
+Fast DDS handles transmission in its own worker. The Humble Python binding
+holds the GIL during publication. [Fast DDS publication modes](https://github.com/ros2/rmw_fastrtps/blob/humble/README.md)
+[Humble publisher implementation](https://github.com/ros2/rclpy/blob/humble/rclpy/src/rclpy/publisher.cpp#L113-L125)
+
+Disarmed Nav2 sessions tolerate a status gap within the existing one-second
+clock-proof lifetime. The adapter suspends forwarding at 230 ms and requires
+a new source sample after recovery. Once a nonzero command is forwarded,
+the 230 ms status deadline applies until verified stationary feedback covers
+that command. The bridge independently enforces the original command's
+230 ms movement deadline and firmware independently enforces its 300 ms
+heartbeat. A fresh terminal zero triggers verified STOP and allows silence.
+Silence after an admitted movement without a terminal stop triggers a fault.
+
+Keep the adapter on the laptop with the sole Nav2 Twist publisher.
+Raw Twist DDS timestamps are checked on their host. The bridge and adapter
+use the existing Pi–laptop clock proof and pin publisher endpoints. Moving
+only the adapter to the Pi would leave the remote raw publisher outside
+that proof.
+
+### Deploy and check stationary communication
+
+On the laptop, copy the changed bridge dependencies into the existing V3.3
+deployment. Set `PI_HOST` to the working Pi SSH login. The last deployment
+used the following address and directory.
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+git switch phase6d-nav2-stable
+PI_HOST=ubuntu@192.168.50.11
+scp amr_ground_protocol.py amr_ros2_bridge_v3.py amr_ros2_bridge_v3_2.py "$PI_HOST:~/amr_uart_v33/"
+```
+
+Stop the previous bridge and adapter, cancel any active goal, and isolate
+motor power. Keep the existing LiDAR, robot-state publisher, wheel odometry
+and AMCL running with the saved map. In each ROS terminal source Humble and
+use the robot's existing domain, shown here as 42. If the laptop Nav2 launch
+is down, start it in a separate laptop terminal.
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/dev_ws/install/setup.bash
+export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0
+ros2 launch ~/dev_ws/config/navigation_amr.launch.py \
+    params_file:="$HOME/dev_ws/config/nav2_amr_real.yaml" \
+    use_sim_time:=False autostart:=True
+```
+
+On the Pi, start Bridge V3.3 and type `CLEAR_AREA_CUTOFF_READY`. Keep
+this terminal open for STOP verification. The 30-second movement budget
+starts at the first arm.
+
+```bash
+cd ~/amr_uart_v33
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0
+RMW_IMPLEMENTATION=rmw_fastrtps_cpp RMW_FASTRTPS_PUBLICATION_MODE=ASYNCHRONOUS \
+    python3 -B amr_ros2_bridge_v3_3.py --port /dev/serial0 --ground-control \
+    --source nav2 --session-seconds 30 --link-diagnostics 2>&1 | tee -a ~/nav2_bridge_6d3.log
+```
+
+On the laptop, confirm `ros2 topic info -v /amr/nav2_cmd_vel` shows exactly
+one local Nav2 publisher. Paste the bridge session ID at `read` and type
+`ACTIVATE <session-id>` at the adapter prompt. The stationary check keeps
+the status and clock exchange live with velocity forwarding disabled.
+
+```bash
+cd ~/amr_phase_v3_work/ESP32_AMR
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0
+read -r SESSION
+python3 -B tools/amr_cmd_vel_adapter.py --session "$SESSION" --source nav2 \
+    --stationary-check --link-diagnostics 2>&1 | tee ~/nav2_adapter_6d3_stationary.log
+```
+
+In another laptop terminal with the same ROS environment, wait for the
+first status to show `OWNED`, `READY`, `stationary_ready=true`, valid encoder
+continuity, no firmware or bridge fault and zero PWM with both arm and run
+false. Observe for at least 120 seconds and confirm the same healthy state
+and session at the end. Check both logs for faults during the interval.
+
+```bash
+ros2 topic echo --once /amr_bridge/status
+timeout --signal=INT 125s ros2 topic hz /amr_bridge/status
+ros2 topic echo --once /amr_bridge/status
+```
+
+### Run one short goal and recover
+
+Keep the physical cutoff within reach. After the stationary check, stop
+the adapter and bridge with Ctrl+C and confirm the bridge prints
+`Final STOP and stationary feedback verified`. Restart the bridge with
+the same Pi command and use its new session ID in the laptop command
+below. Keep the localization and navigation processes running. Verify
+the robot's pose, clear path and healthy `OWNED` / `READY` status before
+enabling motor power.
+
+```bash
+read -r SESSION
+python3 -B tools/amr_cmd_vel_adapter.py --session "$SESSION" --source nav2 \
+    --link-diagnostics 2>&1 | tee ~/nav2_adapter_6d3_motion.log
+```
+
+In a separate laptop ROS terminal, use the map pose to choose a goal
+approximately 0.25 m straight ahead in clear space with the current yaw.
+Enter the goal's map-frame X and Y and normalized yaw quaternion Z and W
+when prompted by `read`.
+
+```bash
+ros2 run tf2_ros tf2_echo map base_link
+# Stop tf2_echo with Ctrl+C after obtaining the pose.
+read -r X Y QZ QW
+ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
+    "{pose: {header: {frame_id: map}, pose: {position: {x: $X, y: $Y, z: 0.0}, orientation: {z: $QZ, w: $QW}}}}" \
+    --feedback
+ros2 topic echo --once /amr_bridge/status
+```
+
+Confirm the action reports `SUCCEEDED`, then wait for `READY` and confirm
+verified stationary STOP, zero PWM and disarmed firmware. The 5 RPM floor corresponds to
+approximately 0.023 m/s straight or 0.152 rad/s for in-place rotation.
+Fresh RPP commands below that floor are inhibited. A change of driven
+wheel or direction requires a confirmed stop before a new command can arm.
+Check any repeated `LOW_SPEED_INHIBITED` against the requested wheel pair,
+particularly on tight curves and during final heading alignment.
+
+Verify physical loss behavior separately with both wheels raised and the
+motor cutoff ready. Use the existing `source-loss` commissioning profile
+above with `amr_ros2_bridge_v3_3.py --raised-commissioning --source commissioning`.
+Confirm `FAULT_LATCHED`, `stop_verified=true`, zero PWM and disarmed
+firmware. If any run faults, cut motor power, cancel the active
+goal, stop the adapter and bridge, and capture the fault reason. A
+host-only fault with healthy firmware can recover by starting those two
+processes and confirming a new session. A firmware fault or unverified STOP
+requires diagnosis with motor power isolated before another activation.

@@ -242,11 +242,14 @@ class GuardedBridge:
             return
         self.state = State.FAULT_LATCHED
         self.fault_reason = reason
-        self.report(f'FAULT_LATCHED: {reason}')
+        stop_error = None
         try:
             self.verify_stop()
         except (RuntimeError, OSError) as exc:
-            self.report(f'STOP verification failed: {exc}. CUT MOTOR POWER PHYSICALLY.')
+            stop_error = exc
+        self.report(f'FAULT_LATCHED: {reason}')
+        if stop_error is not None:
+            self.report(f'STOP verification failed: {stop_error}. CUT MOTOR POWER PHYSICALLY.')
 
     def begin_stop(self):
         self.state = State.STOPPING

@@ -323,7 +323,12 @@ class GroundTest(unittest.TestCase):
             self.assertFalse(self.bridge.encoder_valid)
 
     def test_adapter_clock_handshake_and_velocity_end_to_end_with_mock_uart(self):
-        self.setup(source='teleop')
+        for source in ('teleop', 'nav2'):
+            with self.subTest(source=source):
+                self.check_adapter_motion(source)
+
+    def check_adapter_motion(self, source):
+        self.setup(source=source)
         clock, bridge = self.clock, self.bridge
         laptop = lambda: clock.wall() + 5_000_000
 
@@ -338,7 +343,7 @@ class GroundTest(unittest.TestCase):
             components = (value.linear.x, 0, 0, 0, 0, value.angular.z)
             bridge.command(components, stamp, dds(sent, clock.wall(), COMMAND_GID))
 
-        adapter = CommandAdapter(bridge.session, 'teleop', send_velocity, send_control,
+        adapter = CommandAdapter(bridge.session, source, send_velocity, send_control,
                                  now=clock.now, wall_ns=laptop, activation=ACTIVATION)
         adapter.observe((RAW_GID,), (STATUS_GID,))
         bridge.observe_publishers((COMMAND_GID,), (CONTROL_GID,))
@@ -366,9 +371,34 @@ class GroundTest(unittest.TestCase):
         self.assertEqual(bridge.state, State.RUNNING)
         self.assertTrue(bridge.status()['firmware_run_confirmed'])
         self.assertGreater(bridge.status()['source_age_s'], bridge.status()['adapter_receipt_age_s'])
+        if source == 'teleop':
+            clock.seconds += DEADMAN_S
+            adapter.tick()
+            self.assertEqual(bridge.state, State.FAULT_LATCHED)
+            self.assertFalse(self.serial.running)
+            return
+
+        adapter.sample(twist(vx=0.), dds(laptop(), gid=RAW_GID))
+        self.assertEqual(bridge.state, State.STOPPING)
+        for _ in range(8):
+            self.tick()
+            status()
+            adapter.tick()
+        self.assertEqual(bridge.state, State.READY)
+        self.assertIsNone(adapter.last_motion_source)
+        self.assertIsNone(adapter.fault_reason)
+        self.assertTrue(bridge.stop_verified)
+        self.assertFalse(self.serial.armed)
+
+        adapter.sample(twist(), dds(laptop(), gid=RAW_GID))
+        self.tick()
+        self.assertEqual(bridge.state, Transition.STARTING)
         clock.seconds += DEADMAN_S
-        adapter.tick()
+        bridge.tick()  # Source stops without a terminal zero.
         self.assertEqual(bridge.state, State.FAULT_LATCHED)
+        self.assertIn('deadman expired', bridge.fault_reason)
+        self.assertTrue(bridge.stop_verified)
+        self.assertFalse(self.serial.armed)
         self.assertFalse(self.serial.running)
 
     def test_shutdown_checks_stop_and_stationarity(self):
@@ -433,6 +463,45 @@ class AdapterTest(unittest.TestCase):
         self.assertIn('arrival gap', self.adapter.fault_reason)
         self.adapter.sample(value, dds(self.clock.wall()))
         self.assertEqual(len(self.out), 1)
+
+    def test_nav2_idle_status_gap_pauses_forwarding_and_active_gap_faults(self):
+        self.adapter.source = 'nav2'
+
+        def ready(**fields):
+            wall = self.clock.wall()
+            packet = dict(session_id=self.session, command_source='nav2', version='3.3',
+                          bridge_mode='ground', state='READY', uart_link_ready=True,
+                          authority_state='OWNED', clock_status='VERIFIED',
+                          adapter_activation=ACTIVATION, stationary_ready=True) | fields
+            self.adapter.status(packet, dds(wall, gid=STATUS_GID), (STATUS_GID,))
+
+        ready()
+        self.clock.seconds += .383
+        self.adapter.tick()
+        self.assertIsNone(self.adapter.fault_reason)
+        original = dds(self.clock.wall(), gid=RAW_GID)
+        self.adapter.sample(twist(), original)
+        ready()
+        self.adapter.sample(twist(), original)
+        self.assertFalse(self.out)
+        self.clock.seconds += .01
+        source_ns = self.clock.wall()
+        self.adapter.sample(twist(), dds(source_ns, gid=RAW_GID))
+        self.assertEqual(len(self.out), 1)
+        self.clock.seconds += .06
+        ready(stationary_source_cutoff_ns=source_ns - 1)
+        self.assertEqual(self.adapter.last_motion_source, source_ns)
+        self.clock.seconds += .24
+        self.adapter.tick()
+        self.assertEqual(self.adapter.fault_reason, 'bridge status stream lost')
+
+    def test_nav2_stationary_check_never_forwards_velocity(self):
+        self.adapter.source = 'nav2'
+        self.adapter.stationary_check = True
+        self.adapter.bridge_allows_commands = True
+        self.adapter.sample(twist(), dds(self.clock.wall(), gid=RAW_GID))
+        self.assertFalse(self.out)
+        self.assertIsNone(self.adapter.last_motion_source)
 
     def test_fresh_input_after_missed_deadline_cannot_renew_adapter(self):
         self.status()

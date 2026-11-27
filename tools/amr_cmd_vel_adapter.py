@@ -11,7 +11,7 @@ if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from amr_ground_protocol import (
-    CLOCK_OFFSET_NS, CONTROL_TOPIC, DEADMAN_NS, DISCOVERY_S, GROUND_TOPIC, NS, SOURCE_TOPICS,
+    CLOCK_OFFSET_NS, CLOCK_PROOF_S, CONTROL_TOPIC, DEADMAN_NS, DISCOVERY_S, GROUND_TOPIC, NS, SOURCE_TOPICS,
     STATUS_TOPIC, AuthorityError, CommandStamp, DDSStamp, WallClockGuard, check_dds_publisher, command_qos,
     arrival_monotonic, inspect_publishers, metadata_executor, status_qos, token_valid,
 )
@@ -22,7 +22,8 @@ from amr_ros2_bridge_v3_1 import twist_components
 
 class CommandAdapter:
     def __init__(self, session, source, send_velocity, send_control, *,
-                 now=time.monotonic, wall_ns=time.time_ns, activation=None, metrics=None):
+                 now=time.monotonic, wall_ns=time.time_ns, activation=None, metrics=None,
+                 stationary_check=False):
         if not token_valid(session) or source not in SOURCE_TOPICS:
             raise ValueError('valid bridge session and exactly one source required')
         self.session, self.source = session, source
@@ -31,12 +32,14 @@ class CommandAdapter:
         self.metrics = metrics
         self.clock = WallClockGuard(now, wall_ns)
         self.send_velocity, self.send_control = send_velocity, send_control
+        self.stationary_check = stationary_check
         self.bridge_gid = None
         self.raw_candidate = self.raw_owner = None
         self.discovered_at = None
         self.raw_cutoff = self.clock.check()
         self.last_status_at = self.last_probe_at = None
         self.last_source = None
+        self.last_motion_source = None
         self.bridge_allows_commands = False
         self.fault_reason = None
 
@@ -128,13 +131,17 @@ class CommandAdapter:
         received_at = arrival_monotonic(t2, wall, self.now())
         if self.last_status_at is not None:
             gap = received_at - self.last_status_at
-            if gap >= DEADMAN_S:
+            if gap >= self.status_deadline():
                 self.status_result('rejected', 'dds_arrival_gap')
                 self.fault('bridge status stream lost', gap)
                 return
             if gap <= 0:
                 self.status_result('ignored', 'out_of_order_receipt')
                 return
+            if gap >= DEADMAN_S:
+                self.raw_cutoff = wall
+                if self.metrics:
+                    self.metrics.sample('idle_status_gap_ms', gap * 1000)
         self.bridge_gid = publishers[0]
         self.last_status_at = received_at
         self.status_result('accepted')
@@ -146,6 +153,12 @@ class CommandAdapter:
                 self.metrics.latest['bridge_reported_fault_reason'] = message.get('fault_reason')
             self.fault('bridge latched a fault')
             return
+        cutoff = message.get('stationary_source_cutoff_ns')
+        if (self.last_motion_source is not None and owned and message.get('stationary_ready') is True
+                and type(cutoff) is int and cutoff >= self.last_motion_source):
+            # Only verified stationary feedback that covers the last forwarded
+            # movement can restore the idle deadline.
+            self.last_motion_source = None
         self.bridge_allows_commands = (owned and message.get('clock_status') == 'VERIFIED'
                                        and (version == '3.2' or message.get('uart_link_ready') is True)
                                        and message.get('state') in ('READY', 'STARTING', 'RUNNING'))
@@ -160,8 +173,13 @@ class CommandAdapter:
                 self.metrics.event('clock_responses_sent')
             self.send_control(self.control_payload('clock', t1=t1, t2=t2, t3=self.clock.check()))
 
+    def status_deadline(self):
+        if self.source == 'nav2' and self.last_motion_source is None:
+            return CLOCK_PROOF_S
+        return DEADMAN_S
+
     def status_overdue(self):
-        return self.last_status_at is not None and self.now() - self.last_status_at >= DEADMAN_S
+        return self.last_status_at is not None and self.now() - self.last_status_at >= self.status_deadline()
 
     def sample(self, twist, info):
         if self.fault_reason or self.raw_owner is None:
@@ -169,22 +187,28 @@ class CommandAdapter:
         if self.status_overdue():
             self.fault('bridge status stream lost', self.now() - self.last_status_at)
             return
+        if (self.source == 'nav2' and self.last_status_at is not None
+                and self.now() - self.last_status_at >= DEADMAN_S):
+            return  # Pause admission while idle status is late.
         try:
             wall = self.clock.check()
             check_dds_publisher(info, self.raw_owner)
             stamp = DDSStamp.read(info, wall)
-            if self.last_source is not None and wall - self.last_source >= DEADMAN_NS:
+            if self.source != 'nav2' and self.last_source is not None and wall - self.last_source >= DEADMAN_NS:
                 self.fault('selected source arrival gap', (wall - self.last_source) / NS)
                 return
             if stamp.source <= self.raw_cutoff or (
                     self.last_source is not None and stamp.source <= self.last_source):
                 return
-            wheel_targets(twist_components(twist))
+            components = twist_components(twist)
+            wheel_targets(components)
         except (ValueError, AuthorityError) as exc:
             self.fault(str(exc))
             return
         self.last_source = stamp.source
-        if self.bridge_allows_commands:
+        if self.bridge_allows_commands and not self.stationary_check:
+            if self.source == 'nav2' and any(components):
+                self.last_motion_source = stamp.source
             header = CommandStamp(self.session, self.activation, self.source, stamp.source, stamp.received)
             self.send_velocity(twist, header)
 
@@ -195,7 +219,8 @@ class CommandAdapter:
             wall = self.clock.check()
             if self.status_overdue():
                 self.fault('bridge status stream lost', self.now() - self.last_status_at)
-            elif self.last_source is not None and wall - self.last_source >= DEADMAN_NS:
+            elif (self.source != 'nav2' and self.last_source is not None
+                  and wall - self.last_source >= DEADMAN_NS):
                 self.fault('selected source arrival gap', (wall - self.last_source) / NS)
         except AuthorityError as exc:
             self.fault(str(exc))
@@ -265,7 +290,7 @@ def attach_adapter(node, executor, adapter, raw_topic, status_topic=STATUS_TOPIC
     node.create_timer(.04, tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
 
-def run_ros(session, source, diagnostics=False):
+def run_ros(session, source, diagnostics=False, *, stationary_check=False):
     import rclpy
     from geometry_msgs.msg import TwistStamped
     from rclpy.executors import ExternalShutdownException
@@ -295,7 +320,8 @@ def run_ros(session, source, diagnostics=False):
                 print(data['reason'], file=sys.stderr, flush=True)
 
         metrics = LinkMetrics('adapter') if diagnostics else None
-        adapter = CommandAdapter(session, source, send_velocity, send_control, metrics=metrics)
+        adapter = CommandAdapter(session, source, send_velocity, send_control, metrics=metrics,
+                                 stationary_check=stationary_check)
         attach_adapter(node, executor, adapter, SOURCE_TOPICS[source],
                        reporter=PeriodicLinkReport(metrics) if metrics else None)
         executor.add_node(node)
@@ -324,6 +350,8 @@ def main():
     parser.add_argument('--session', required=True, help='session ID printed by the Pi bridge')
     parser.add_argument('--source', required=True, choices=SOURCE_TOPICS)
     parser.add_argument('--link-diagnostics', action='store_true', help='emit bounded link summaries')
+    parser.add_argument('--stationary-check', action='store_true',
+                        help='exercise ownership and clock proof with velocity forwarding disabled')
     args = parser.parse_args()
     if not token_valid(args.session):
         parser.error('--session must be the 32-character bridge session ID')
@@ -337,7 +365,8 @@ def main():
     if received.strip() != f'ACTIVATE {args.session}':
         return 1
     try:
-        return run_ros(args.session, args.source, args.link_diagnostics)
+        return run_ros(args.session, args.source, args.link_diagnostics,
+                       stationary_check=args.stationary_check)
     except ImportError as exc:
         print(f'Adapter dependency unavailable: {exc}', file=sys.stderr, flush=True)
         return 1

@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 import json
 import math
+import os
 import secrets
 import sys
 import time
@@ -12,7 +13,7 @@ from amr_ground_protocol import (
     CLOCK_OFFSET_NS, CLOCK_PROOF_S, CONTROL_TOPIC, DEADMAN_NS, DISCOVERY_S, GROUND_TOPIC,
     NS, SOURCE_TOPICS, STATUS_TOPIC, AuthorityError, CommandStamp, DDSStamp, WallClockGuard,
     arrival_monotonic, check_dds_publisher, clock_proven, command_qos, inspect_publishers,
-    metadata_executor, status_qos, token_valid,
+    metadata_executor, status_qos, telemetry_qos, token_valid,
 )
 from amr_link_metrics import LinkMetrics, PeriodicLinkReport, summarize
 from amr_ros2_bridge_v3 import (
@@ -105,7 +106,12 @@ class BridgeV32(BridgeV31):
 
     def query(self):
         previous = self.previous_encoder
-        feedback = super().query()
+        started = time.monotonic() if self.metrics else None
+        try:
+            feedback = super().query()
+        finally:
+            if self.metrics:
+                self.metrics.sample('uart_query_ms', (time.monotonic() - started) * 1000)
         if self.encoder_boot is None:
             self.encoder_boot = feedback.boot
         if self.encoder_boot is None:
@@ -403,6 +409,9 @@ class BridgeV32(BridgeV31):
             'adapter_receipt_age_s': ((wall - self.last_stamp.receipt_ns + CLOCK_OFFSET_NS) / NS
                                       if self.last_stamp else None),
             'stop_reason': self.stop_reason, 'low_speed_inhibited': self.low_inhibited,
+            'stationary_source_cutoff_ns': (
+                max(self.source_cutoff + CLOCK_OFFSET_NS, self.last_source)
+                if result['stationary_ready'] and self.command_at is None else None),
             'encoder_continuity_valid': self.encoder_valid,
             'encoder_discontinuity_reason': self.encoder_invalid_reason,
         })
@@ -428,7 +437,8 @@ def attach_bridge_link(node, executor, bridge, *, status_topic=STATUS_TOPIC,
 
     sequence = 0
     metrics = bridge.metrics
-    status_pub = node.create_publisher(String, status_topic, status_qos(publisher=True))
+    qos = telemetry_qos() if bridge.source == 'nav2' else status_qos(publisher=True)
+    status_pub = node.create_publisher(String, status_topic, qos)
 
     def observe():
         bridge.observe_publishers(inspect_publishers(node, ground_topic, metrics),
@@ -472,8 +482,11 @@ def attach_bridge_link(node, executor, bridge, *, status_topic=STATUS_TOPIC,
             payload = bridge.status()
         payload['status_sequence'] = sequence
         payload['clock_probe_ns'] = probe
-        status_pub.publish(String(data=json.dumps(payload, allow_nan=False)))
+        msg = String(data=json.dumps(payload, allow_nan=False))
+        started = time.monotonic() if metrics else None
+        status_pub.publish(msg)
         if metrics:
+            metrics.sample('status_publish_ms', (time.monotonic() - started) * 1000)
             metrics.sequence(sequence)
             metrics.event('status_published')
             metrics.latest['last_clock_proof_age_s'] = bridge.clock_proof_age()
@@ -485,6 +498,10 @@ def attach_bridge_link(node, executor, bridge, *, status_topic=STATUS_TOPIC,
 
 
 def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *, bridge_class=BridgeV32):
+    if source == 'nav2':
+        # Let Fast DDS send telemetry on its worker. A Python publishing
+        # thread would still hold the GIL inside Humble's rcl_publish binding.
+        os.environ.setdefault('RMW_FASTRTPS_PUBLICATION_MODE', 'ASYNCHRONOUS')
     import rclpy
     from geometry_msgs.msg import TwistStamped
     from rclpy.clock import Clock, ClockType
@@ -498,7 +515,8 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
     try:
         executor = metadata_executor() if commissioning else SingleThreadedExecutor()
         node = rclpy.create_node('amr_serial_bridge')
-        joint_pub = node.create_publisher(JointState, '/joint_states', 10)
+        joint_qos = telemetry_qos() if source == 'nav2' else 10
+        joint_pub = node.create_publisher(JointState, '/joint_states', joint_qos)
         metrics = LinkMetrics('bridge') if diagnostics else None
         reporter = PeriodicLinkReport(metrics) if metrics else None
         with exclusive_uart(port) as uart:
@@ -516,17 +534,22 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
                     previous = bridge.feedback
                     bridge.tick()
                     feedback = bridge.feedback
-                    if bridge.encoder_valid and feedback is not previous:
+                    fresh_encoders = bridge.encoder_valid and feedback is not previous
+                    stamp = node.get_clock().now().to_msg() if fresh_encoders else None
+                    publish()
+                    if fresh_encoders:
                         msg = JointState()
-                        msg.header.stamp = node.get_clock().now().to_msg()
+                        msg.header.stamp = stamp
                         msg.name = ['left_wheel_joint', 'right_wheel_joint']
                         msg.position = [ticks * 2 * math.pi / CPR for ticks in feedback.ticks]
                         msg.velocity = [rpm * 2 * math.pi / 60 for rpm in feedback.measured]
+                        joint_started = time.monotonic() if metrics else None
                         joint_pub.publish(msg)
-                    publish()
+                        if metrics:
+                            metrics.sample('joint_publish_ms', (time.monotonic() - joint_started) * 1000)
                     if metrics:
-                        metrics.sample('timer_execution_ms', (time.monotonic() - started) * 1000)
                         reporter.poll()
+                        metrics.sample('timer_execution_ms', (time.monotonic() - started) * 1000)
 
                 def on_command(msg, info):
                     before_tick()

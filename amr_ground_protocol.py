@@ -129,6 +129,14 @@ def status_qos(*, publisher=False):
     return 10 if publisher else command_qos()
 
 
+def telemetry_qos():
+    from rclpy.qos import ReliabilityPolicy
+
+    qos = command_qos()
+    qos.reliability = ReliabilityPolicy.RELIABLE
+    return qos
+
+
 def arrival_monotonic(received_ns, wall_ns, now):
     return now - (wall_ns - received_ns) / NS
 
