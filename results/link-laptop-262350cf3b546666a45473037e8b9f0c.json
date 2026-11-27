@@ -1,0 +1,74 @@
+{
+  "role": "adapter",
+  "counts": {
+    "status_taken": 2000,
+    "status_callbacks": 2000,
+    "status_accepted": 2000,
+    "status_ignored": 0,
+    "status_rejected": 0,
+    "clock_responses_sent": 780
+  },
+  "latest": {
+    "fault_reason": null,
+    "status_timestamps": {
+      "dds_source_ns": 1795758114169892131,
+      "dds_received_ns": 1795758114169329461,
+      "callback_processing_ns": 1795758114169645292
+    },
+    "status_sequence": 2066,
+    "last_accepted_dds_received_ns": 1795758114169329461,
+    "bridge_reported_clock_proof_age_s": 0.11473140199996124,
+    "outcome": "PASS"
+  },
+  "intervals_ms": {
+    "status_processing_delay_ms": {
+      "samples": 2000,
+      "max": 0.368076,
+      "p50": 0.314643,
+      "p95": 0.343138,
+      "p99": 0.352641
+    },
+    "graph_inspection_ms": {
+      "samples": 4096,
+      "max": 0.8655720012029633,
+      "p50": 0.09498599865764845,
+      "p95": 0.1341679999313783,
+      "p99": 0.15079100012371782
+    },
+    "status_callback_ms": {
+      "samples": 2000,
+      "max": 1.0709819998737657,
+      "p50": 0.24458899861201644,
+      "p95": 0.3823200004262617,
+      "p99": 0.4036919999634847
+    },
+    "timer_interval_ms": {
+      "samples": 2998,
+      "max": 40.781608999168384,
+      "p50": 40.001527000640635,
+      "p95": 40.41076800058363,
+      "p99": 40.547309999965364
+    },
+    "timer_delay_ms": {
+      "samples": 2998,
+      "max": 3.6580184332706267,
+      "p50": 1.826143910875544,
+      "p95": 3.208269767128513,
+      "p99": 3.5110895605612313
+    },
+    "status_callback_interval_ms": {
+      "samples": 1999,
+      "max": 69.51578199914366,
+      "p50": 59.99577200054773,
+      "p95": 60.72004300040135,
+      "p99": 65.36388399945281
+    },
+    "status_dds_interval_ms": {
+      "samples": 1999,
+      "max": 69.51451301574707,
+      "p50": 59.996843338012695,
+      "p95": 60.6846809387207,
+      "p99": 65.38057327270508
+    }
+  }
+}

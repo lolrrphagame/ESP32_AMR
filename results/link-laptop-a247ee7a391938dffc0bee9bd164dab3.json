@@ -1,0 +1,85 @@
+{
+  "role": "adapter",
+  "counts": {
+    "status_taken": 1978,
+    "status_callbacks": 1978,
+    "status_accepted": 399,
+    "status_ignored": 1579,
+    "status_rejected": 0,
+    "clock_responses_sent": 155,
+    "status_reason:adapter_faulted": 1579
+  },
+  "latest": {
+    "fault_reason": "bridge latched a fault",
+    "status_timestamps": {
+      "dds_source_ns": 1795749588127212225,
+      "dds_received_ns": 1795749588107673888,
+      "callback_processing_ns": 1795749588108025323
+    },
+    "status_sequence": 635,
+    "last_accepted_dds_received_ns": 1795749493011242846,
+    "bridge_reported_clock_proof_age_s": 1.0134583330000169,
+    "bridge_reported_fault_reason": "ground authority clock proof missing or expired",
+    "timeout_age_s": null,
+    "fault_status_sequence": 635,
+    "fault_status_timestamps": {
+      "dds_source_ns": 1795749493026168529,
+      "dds_received_ns": 1795749493011242846,
+      "callback_processing_ns": 1795749493011533724
+    },
+    "fault_last_accepted_dds_received_ns": 1795749493011242846,
+    "last_status_rejection": "adapter_faulted",
+    "outcome": "FAIL"
+  },
+  "intervals_ms": {
+    "graph_inspection_ms": {
+      "samples": 4096,
+      "max": 0.8595730000138246,
+      "p50": 0.06292599999824233,
+      "p95": 0.14009900002065478,
+      "p99": 0.1638439999851471
+    },
+    "timer_interval_ms": {
+      "samples": 2999,
+      "max": 40.74384999995573,
+      "p50": 39.9981470000057,
+      "p95": 40.405005000025085,
+      "p99": 40.54645299999038
+    },
+    "timer_delay_ms": {
+      "samples": 2999,
+      "max": 0.3050219989972902,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.001450995455343218
+    },
+    "status_processing_delay_ms": {
+      "samples": 1978,
+      "max": 0.546147,
+      "p50": 0.308689,
+      "p95": 0.346685,
+      "p99": 0.35618
+    },
+    "status_callback_ms": {
+      "samples": 1978,
+      "max": 0.9664259999908609,
+      "p50": 0.21964699999443837,
+      "p95": 0.36448800000243864,
+      "p99": 0.4119760000094175
+    },
+    "status_callback_interval_ms": {
+      "samples": 1977,
+      "max": 243.87310299999854,
+      "p50": 59.989091999966604,
+      "p95": 61.4676920000079,
+      "p99": 62.42243899998812
+    },
+    "status_dds_interval_ms": {
+      "samples": 1977,
+      "max": 243.87788772583008,
+      "p50": 59.99255180358887,
+      "p95": 61.48219108581543,
+      "p99": 62.44468688964844
+    }
+  }
+}
