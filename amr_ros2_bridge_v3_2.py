@@ -513,7 +513,7 @@ def attach_bridge_link(node, executor, bridge, *, status_topic=STATUS_TOPIC,
 
 
 def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *, bridge_class=BridgeV32,
-            observer=None, stationary_shutdown=False):
+            observer=None, stationary_shutdown=False, startup=None):
     from amr_nav2_peer import public_domain
     domain = public_domain()
     if domain is not None and commissioning and source != 'nav2':
@@ -523,6 +523,8 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
         # Let Fast DDS send telemetry on its worker. A Python publishing
         # thread would still hold the GIL inside Humble's rcl_publish binding.
         os.environ.setdefault('RMW_FASTRTPS_PUBLICATION_MODE', 'ASYNCHRONOUS')
+    if startup:
+        startup('importing ROS Python modules')
     import rclpy
     from geometry_msgs.msg import TwistStamped
     from rclpy.clock import Clock, ClockType
@@ -532,8 +534,12 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
     node = executor = joint_telemetry = None
     result = 0
     metrics = None
+    if startup:
+        startup('ROS imports complete; initializing rclpy')
     rclpy.init(args=[])
     try:
+        if startup:
+            startup('rclpy initialized; creating executor and DDS endpoints')
         executor = metadata_executor() if commissioning else SingleThreadedExecutor()
         node = rclpy.create_node('amr_serial_bridge')
         if separate_telemetry:
@@ -542,11 +548,15 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
             joint_pub = node.create_publisher(JointState, '/joint_states', 10)
         metrics = LinkMetrics('bridge') if diagnostics else None
         reporter = PeriodicLinkReport(metrics) if metrics else None
+        if startup:
+            startup('opening exclusive UART')
         with exclusive_uart(port) as uart:
             bridge = bridge_class(uart, commissioning, source, duration, limits, metrics=metrics)
             bridge.pi_nav2 = domain is not None
             before_tick, publish = attach_bridge_link(node, executor, bridge)
             try:
+                if startup:
+                    startup('verifying ESP32 safe startup over UART')
                 bridge.start()
 
                 def tick():
@@ -601,6 +611,8 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
                         print(f'Session {bridge.session}, selected source {source}', flush=True)
                 node.create_timer(LOOP_PERIOD_S, tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
                 executor.add_node(node)
+                if startup:
+                    startup('UART startup finished; observer and executor ready')
                 executor.spin()
             finally:
                 verified = bridge.shutdown(stationary=True) if stationary_shutdown else bridge.shutdown()

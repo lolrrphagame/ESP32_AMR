@@ -348,20 +348,28 @@ def attach_adapter(node, executor, adapter, raw_topic, status_topic=STATUS_TOPIC
     node.create_timer(.04, tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
 
-def run_ros(session, source, diagnostics=False, *, stationary_check=False, laptop=None, observer=None):
+def run_ros(session, source, diagnostics=False, *, stationary_check=False, laptop=None, observer=None,
+            startup=None, motion_gate=None):
+    if startup:
+        startup('importing ROS Python modules')
     import rclpy
     from geometry_msgs.msg import TwistStamped
+    from rclpy.clock import Clock, ClockType
     from rclpy.executors import ExternalShutdownException
     from std_msgs.msg import String
 
     from amr_nav2_peer import PeerSocket, PiIngress, public_domain
     if bool(laptop) != (public_domain() is not None) or (laptop and source != 'nav2'):
         raise AuthorityError('use --laptop with the Pi private Nav2 domain')
+    if startup:
+        startup('ROS imports complete; initializing rclpy')
     node = executor = adapter = link = None
     rclpy.init(args=[])
     result = 0
     metrics = None
     try:
+        if startup:
+            startup('rclpy initialized; creating executor and DDS endpoints')
         executor = metadata_executor()
         node = rclpy.create_node('amr_cmd_vel_adapter')
         stamped_pub = node.create_publisher(TwistStamped, GROUND_TOPIC, command_qos())
@@ -382,28 +390,46 @@ def run_ros(session, source, diagnostics=False, *, stationary_check=False, lapto
 
         metrics = LinkMetrics('adapter') if diagnostics else None
         adapter = CommandAdapter(session, source, send_velocity, send_control, metrics=metrics,
-                                 stationary_check=stationary_check, remote_nav2=bool(laptop))
+                                 stationary_check=stationary_check or motion_gate is not None,
+                                 remote_nav2=bool(laptop))
+        if startup:
+            startup('DDS endpoints created; setting up peer socket' if laptop else
+                    'DDS endpoints created; using local ROS input')
         link = PeerSocket(session, laptop, pi=True) if laptop else None
         ingress = PiIngress(link, adapter) if link else None
+        if startup:
+            startup('peer socket ready; wiring Adapter callbacks' if link else
+                    'wiring Adapter callbacks')
         attach_adapter(node, executor, adapter, SOURCE_TOPICS[source],
                        reporter=PeriodicLinkReport(metrics) if metrics else None,
                        ingress=ingress)
         if observer is not None:
             def observe():
                 now = adapter.now()
+                ready = (adapter.raw_owner is not None and adapter.bridge_allows_commands
+                         and not adapter.status_overdue())
+                remote_clock = (ingress is not None and not ingress.inhibited
+                                and ingress.independent_proof_at is not None
+                                and now - ingress.independent_proof_at < CLOCK_PROOF_S)
+                if (motion_gate is not None and not stationary_check and adapter.stationary_check
+                        and not adapter.fault_reason and motion_gate()):
+                    if not (ready and adapter.pre_arm_stop and (not laptop or remote_clock)):
+                        adapter.fault('ownership, clock proof or stationary STOP lost before release')
+                    else:
+                        # Drop pre-release inputs and goals, including any queued DDS/UDP samples.
+                        adapter.raw_cutoff = adapter.clock.check()
+                        adapter.stationary_check = False
                 observer(dict(
                     session_id=adapter.session, activation=adapter.activation, fault=adapter.fault_reason,
-                    ready=adapter.raw_owner is not None and adapter.bridge_allows_commands
-                    and not adapter.status_overdue(),
-                    remote_clock=(ingress is not None and not ingress.inhibited
-                                  and ingress.independent_proof_at is not None
-                                  and now - ingress.independent_proof_at < CLOCK_PROOF_S),
+                    ready=ready and not adapter.fault_reason, remote_clock=remote_clock,
                     remote_inhibited=ingress is not None and ingress.inhibited,
+                    motion_enabled=not adapter.stationary_check,
                 ))
 
-            from rclpy.clock import Clock, ClockType
             node.create_timer(.04, observe, clock=Clock(clock_type=ClockType.STEADY_TIME))
         executor.add_node(node)
+        if startup:
+            startup('observer and executor ready; waiting for first timer tick')
         executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
