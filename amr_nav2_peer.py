@@ -49,6 +49,7 @@ class PiIngress:
         self.owner = None
         self.gid = None
         self.proof_at = None
+        self.independent_proof_at = None
 
     def poll(self, on_command):
         now = self.adapter.now()
@@ -106,6 +107,7 @@ class PiIngress:
                   file=sys.stderr, flush=True)
         self.proof_at = max(issued_at, self.proof_at or issued_at)
         if kind == 'clock':
+            self.independent_proof_at = max(issued_at, self.independent_proof_at or issued_at)
             if self.adapter.metrics:
                 self.adapter.metrics.event('remote_clock_proven')
             return

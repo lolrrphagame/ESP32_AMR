@@ -93,7 +93,12 @@ def exclusive_uart(port_name):
                          exclusive=True)
     try:
         fcntl.ioctl(port.fileno(), termios.TIOCEXCL)
-        yield Uart(port)
+        try:
+            yield Uart(port)
+        finally:
+            # Release the kernel TTY claim before the next explicitly staged session.
+            # pyserial still holds its advisory lock until close.
+            fcntl.ioctl(port.fileno(), termios.TIOCNXCL)
     finally:
         port.close()
 

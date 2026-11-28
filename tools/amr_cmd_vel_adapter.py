@@ -348,7 +348,7 @@ def attach_adapter(node, executor, adapter, raw_topic, status_topic=STATUS_TOPIC
     node.create_timer(.04, tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
 
-def run_ros(session, source, diagnostics=False, *, stationary_check=False, laptop=None):
+def run_ros(session, source, diagnostics=False, *, stationary_check=False, laptop=None, observer=None):
     import rclpy
     from geometry_msgs.msg import TwistStamped
     from rclpy.executors import ExternalShutdownException
@@ -384,9 +384,25 @@ def run_ros(session, source, diagnostics=False, *, stationary_check=False, lapto
         adapter = CommandAdapter(session, source, send_velocity, send_control, metrics=metrics,
                                  stationary_check=stationary_check, remote_nav2=bool(laptop))
         link = PeerSocket(session, laptop, pi=True) if laptop else None
+        ingress = PiIngress(link, adapter) if link else None
         attach_adapter(node, executor, adapter, SOURCE_TOPICS[source],
                        reporter=PeriodicLinkReport(metrics) if metrics else None,
-                       ingress=PiIngress(link, adapter) if link else None)
+                       ingress=ingress)
+        if observer is not None:
+            def observe():
+                now = adapter.now()
+                observer(dict(
+                    session_id=adapter.session, activation=adapter.activation, fault=adapter.fault_reason,
+                    ready=adapter.raw_owner is not None and adapter.bridge_allows_commands
+                    and not adapter.status_overdue(),
+                    remote_clock=(ingress is not None and not ingress.inhibited
+                                  and ingress.independent_proof_at is not None
+                                  and now - ingress.independent_proof_at < CLOCK_PROOF_S),
+                    remote_inhibited=ingress is not None and ingress.inhibited,
+                ))
+
+            from rclpy.clock import Clock, ClockType
+            node.create_timer(.04, observe, clock=Clock(clock_type=ClockType.STEADY_TIME))
         executor.add_node(node)
         executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):

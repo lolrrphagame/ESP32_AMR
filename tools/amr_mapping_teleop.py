@@ -20,6 +20,7 @@ from amr_ground_protocol import command_qos, status_qos
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--session', required=True)
+    parser.add_argument('--stationary-check', action='store_true', help='publish STOP only')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9a-f]{32}', args.session):
         parser.error('Expected the current 32-character bridge session')
@@ -38,7 +39,8 @@ def main():
         last_tick = time.monotonic()
         closing = False
         label = tk.StringVar(value='Waiting for Bridge V3.3')
-        action = tk.StringVar(value='STOP — hold a direction to move')
+        action = tk.StringVar(value='Stationary check — STOP only' if args.stationary_check
+                              else 'STOP — hold a direction to move')
 
         def publish(v=0.0, w=0.0):
             msg = Twist()
@@ -90,6 +92,8 @@ def main():
 
         def press(event, name, v, w):
             nonlocal held, pressed_at
+            if args.stationary_check:
+                return 'break'
             if held is not None:
                 stop()
                 return 'break'

@@ -430,10 +430,11 @@ class BridgeV32(BridgeV31):
         })
         return result
 
-    def shutdown(self):
-        if not self.commissioning:
+    def shutdown(self, *, stationary=False):
+        if not self.commissioning and not stationary:
             return super().shutdown()
-        self.latch('operator cancellation or ROS shutdown')
+        if self.commissioning:
+            self.latch('operator cancellation or ROS shutdown')
         try:
             self.verify_stationary_stop()
         except (RuntimeError, OSError) as exc:
@@ -503,6 +504,7 @@ def attach_bridge_link(node, executor, bridge, *, status_topic=STATUS_TOPIC,
             metrics.sequence(sequence)
             metrics.event('status_published')
             metrics.latest['last_clock_proof_age_s'] = bridge.clock_proof_age()
+        return payload
 
     if bridge.commissioning:
         control_sub = executor.subscribe(node, String, control_topic, on_control, command_qos(),
@@ -510,12 +512,14 @@ def attach_bridge_link(node, executor, bridge, *, status_topic=STATUS_TOPIC,
     return before_tick, publish
 
 
-def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *, bridge_class=BridgeV32):
+def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *, bridge_class=BridgeV32,
+            observer=None, stationary_shutdown=False):
     from amr_nav2_peer import public_domain
     domain = public_domain()
-    if domain is not None and source != 'nav2':
+    if domain is not None and commissioning and source != 'nav2':
         raise AuthorityError('private motor domain requires Nav2')
-    if source == 'nav2':
+    separate_telemetry = source == 'nav2' or domain is not None
+    if separate_telemetry:
         # Let Fast DDS send telemetry on its worker. A Python publishing
         # thread would still hold the GIL inside Humble's rcl_publish binding.
         os.environ.setdefault('RMW_FASTRTPS_PUBLICATION_MODE', 'ASYNCHRONOUS')
@@ -532,7 +536,7 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
     try:
         executor = metadata_executor() if commissioning else SingleThreadedExecutor()
         node = rclpy.create_node('amr_serial_bridge')
-        if source == 'nav2':
+        if separate_telemetry:
             joint_telemetry = JointTelemetry(diagnostics)
         else:
             joint_pub = node.create_publisher(JointState, '/joint_states', 10)
@@ -559,7 +563,9 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
                     fresh_encoders = bridge.encoder_valid and feedback is not previous
                     stamp = (node.get_clock().now().to_msg()
                              if fresh_encoders and joint_telemetry is None else None)
-                    publish()
+                    status = publish()
+                    if observer is not None:
+                        observer(status)
                     if fresh_encoders and joint_telemetry is not None:
                         handed_off = joint_telemetry.slot.submit(
                             bridge.feedback_stamp_ns, bridge.feedback_at, feedback.ticks, feedback.measured)
@@ -591,12 +597,14 @@ def run_ros(port, commissioning, source, duration, limits, diagnostics=False, *,
 
                 if commissioning:
                     executor.subscribe(node, TwistStamped, GROUND_TOPIC, on_command, command_qos())
-                    print(f'Session {bridge.session}, selected source {source}', flush=True)
+                    if observer is None:
+                        print(f'Session {bridge.session}, selected source {source}', flush=True)
                 node.create_timer(LOOP_PERIOD_S, tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
                 executor.add_node(node)
                 executor.spin()
             finally:
-                if not bridge.shutdown():
+                verified = bridge.shutdown(stationary=True) if stationary_shutdown else bridge.shutdown()
+                if not verified:
                     result = 1
     except (KeyboardInterrupt, ExternalShutdownException):
         pass

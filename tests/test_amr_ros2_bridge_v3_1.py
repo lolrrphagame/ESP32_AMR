@@ -4,9 +4,10 @@ import csv
 import io
 import math
 import sys
+import termios
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from amr_ros2_bridge_v3 import (
     BENCH_TOPIC, DEADMAN_S, LOOP_PERIOD_S, MAX_ANGULAR_RPS, MAX_LINEAR_MPS,
@@ -442,7 +443,8 @@ class MonitorTest(unittest.TestCase):
                       patch('fcntl.ioctl') as exclusive, patch('rclpy.spin', side_effect=spin),
                       contextlib.redirect_stderr(io.StringIO())):
                     self.assertEqual(run_ros('mock-port', mode, 2 if mode == Mode.LOW else None), 0)
-                exclusive.assert_called_once()
+                self.assertEqual(exclusive.call_args_list,
+                                 [call(-1, termios.TIOCEXCL), call(-1, termios.TIOCNXCL)])
                 self.assertEqual(serial.log[-1], 'Q')
                 self.assertTrue(serial.closed)
 
